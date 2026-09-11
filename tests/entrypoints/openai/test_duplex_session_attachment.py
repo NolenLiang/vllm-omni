@@ -25,18 +25,12 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.mark.asyncio
-async def test_audio_invalidated_while_waiting_for_send_is_not_sequenced_or_journaled():
+async def test_audio_invalidated_while_waiting_for_send_is_not_sequenced_or_journaled(mocker):
     registry = DuplexSessionAttachmentRegistry(replay_ttl_s=60.0, replay_max_bytes_per_session=4096)
     output = DuplexOutputBuffer(max_bytes=4096, max_events=8)
     sent = []
 
-    async def send(payload):
-        sent.append(payload)
-
-    async def close(reason):
-        pass
-
-    await registry.create("s", send=send, close=close)
+    await registry.create("s", send=mocker.AsyncMock(side_effect=sent.append), close=mocker.AsyncMock())
     audio = AudioDelta(session_id="s", response_id="r", epoch=0, delta="AAAA")
     output.put(audio)
     assert await output.get() is audio

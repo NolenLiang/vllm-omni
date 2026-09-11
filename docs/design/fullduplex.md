@@ -204,7 +204,9 @@ reap     DuplexSessionManager.reaper_loop: idle TTL / disconnect grace expiry, c
 
 ### Concurrency and ordering model of the runner
 
-Everything below runs on the orchestrator asyncio loop; there is no lock.
+The runner's session state is owned by the orchestrator asyncio loop and
+needs no lock. The output buffer shared with the caller thread uses a lock
+for queue updates and the final validity check before delivery.
 
 - **Single writer per session.** `DuplexEngineSession` is mutated only by its
   runner. Inputs reach the runner through one mailbox in this order: client
@@ -264,7 +266,9 @@ been tuned from a performance study.
 Errors and response endings have an additional 64 KiB / eight-event reserve
 and retain FIFO order. One final session-closure notification has an independent
 slot, so an exhausted reserve cannot prevent closure or break delivery to
-other sessions. Oversized close details (over 4 KiB with generated identity)
+other sessions. If that reserve also fills, an error or response-ending
+notification may be omitted; the final session-closure notification still
+has its independent slot. Oversized close details (over 4 KiB with generated identity)
 are replaced by a compact reason, preserving terminal type and identity.
 Late writes after closure are ignored; a locally ended iterator is not reopened
 by a late terminal. One event held by the consumer is outside the queued budget.

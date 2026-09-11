@@ -65,10 +65,9 @@ class DuplexOutputBuffer:
         self._reserve_events = reserve_events
         self._lock = threading.Lock()
         self._pending: deque[_PendingEvent] = deque()
-        self._bytes = self._events = 0
+        self._bytes = 0
         self._reserved_bytes = self._reserved_events = 0
         self._held: DuplexEvent | None = None
-        self._held_valid = True
         self._waiter: tuple[asyncio.AbstractEventLoop, asyncio.Future[None]] | None = None
         self._closed = False
         self._terminal: SessionClosed | None = None
@@ -81,11 +80,7 @@ class DuplexOutputBuffer:
     @property
     def pending_events(self) -> int:
         with self._lock:
-            return self._events + self._reserved_events
-
-    @staticmethod
-    def _can_use_reserve(event: DuplexEvent) -> bool:
-        return isinstance(event, ErrorEvent | ResponseDone)
+            return len(self._pending)
 
     def put(self, event: DuplexEvent) -> bool:
         """Append without blocking; overflow leaves the queue unchanged.
@@ -111,9 +106,11 @@ class DuplexOutputBuffer:
         with self._lock:
             if self._closed:
                 return False
-            reserved = self._bytes + size > self._max_bytes or self._events >= self._max_events
+            reserved = self._bytes + size > self._max_bytes or (
+                len(self._pending) - self._reserved_events >= self._max_events
+            )
             if reserved and (
-                not self._can_use_reserve(event)
+                not isinstance(event, ErrorEvent | ResponseDone)
                 or self._reserved_bytes + size > self._reserve_bytes
                 or self._reserved_events >= self._reserve_events
             ):
@@ -124,7 +121,6 @@ class DuplexOutputBuffer:
                 self._reserved_events += 1
             else:
                 self._bytes += size
-                self._events += 1
             waiter = self._waiter
             self._waiter = None
         self._notify(waiter)
@@ -157,11 +153,11 @@ class DuplexOutputBuffer:
                     kept.append(pending)
             self._pending = kept
             if self._held is not None and self._matches(self._held, response_id, through_epoch):
-                self._held_valid = False
+                self._held = None
             return removed
 
     def _is_valid(self, event: DuplexEvent) -> bool:
-        return not isinstance(event, AudioDelta) or (event is self._held and self._held_valid)
+        return not isinstance(event, AudioDelta) or event is self._held
 
     def is_valid(self, event: DuplexEvent) -> bool:
         """Check the current dequeued event; use ``guard`` for an atomic handoff."""
@@ -180,7 +176,6 @@ class DuplexOutputBuffer:
             self._reserved_events -= 1
         else:
             self._bytes -= pending.size
-            self._events -= 1
 
     async def get(self) -> DuplexEvent | None:
         """Return the next event, or ``None`` once a closed buffer is drained."""
@@ -193,7 +188,6 @@ class DuplexOutputBuffer:
                     pending = self._pending.popleft()
                     self._release(pending)
                     self._held = pending.event
-                    self._held_valid = True
                     return pending.event
                 if self._closed:
                     if self._terminal is not None:

@@ -64,8 +64,7 @@ async def test_oversized_close_still_ends_stream_without_reopening_it():
     assert await output.get() is None
 
 
-@pytest.mark.asyncio
-async def test_byte_limit_rejects_audio_without_changing_pending_budget():
+def test_byte_limit_rejects_audio_without_changing_pending_budget():
     output = DuplexOutputBuffer(max_bytes=128, max_events=8)
     with pytest.raises(DuplexOutputOverflowError):
         output.put(AudioDelta(delta="AAAA" * 64))

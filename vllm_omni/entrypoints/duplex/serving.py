@@ -22,6 +22,7 @@ import json
 from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, replace
+from functools import partial
 
 from fastapi import WebSocket, WebSocketDisconnect
 from vllm.logger import init_logger
@@ -335,12 +336,10 @@ class OmniDuplexSessionHandler:
                 with suppress(Exception):
                     await attachment.close(close_reason)
 
-    async def _send_event(
-        self, session_id: str, event: DuplexEvent, *, handle: DuplexSessionHandle | None = None
-    ) -> None:
+    async def _send_event(self, session_id: str, event: DuplexEvent, *, handle: DuplexSessionHandle) -> None:
         payload = event.to_realtime()
         journal = not isinstance(event, _UNJOURNALED_EVENTS) and session_id not in self._resync_required_sessions
-        event_guard = (lambda: handle.output_guard(event)) if handle is not None else None
+        event_guard = partial(handle.output_guard, event)
         try:
             try:
                 await self._attachment_registry.send_event(
