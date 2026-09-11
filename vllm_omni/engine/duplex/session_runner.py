@@ -353,6 +353,30 @@ class DuplexSessionRunner:
         """Whether ``session.closed`` / ``session.expired`` already left this runner."""
         return self._closed_emitted
 
+    def fail_output(self, message: str) -> None:
+        """Experimental overflow policy: fail this response and close only its session."""
+        if self.closing:
+            return
+        session = self.session
+        response_id = session.active_response_id
+        self.manager.invalidate_output(session.session_id, response_id, through_epoch=session.epoch)
+        self._emit_error("output_backpressure", message)
+        if response_id is not None:
+            self.emit(
+                {
+                    "type": "response.done",
+                    "session_id": session.session_id,
+                    "response_id": response_id,
+                    "epoch": session.epoch,
+                    "committed": False,
+                    "status": "failed",
+                    "status_details": {"type": "failed", "reason": "output_backpressure"},
+                    "playback": session.playback.as_dict(),
+                }
+            )
+        self._begin_close("output_backpressure")
+        self.manager.close_from_runner(self, "output_backpressure")
+
     @property
     def closing(self) -> bool:
         """Whether an irreversible close has begun (commands and control ops are refused)."""
@@ -703,6 +727,11 @@ class DuplexSessionRunner:
         accepted, deferred_overlap_payload = self._apply_outbound_session_event(payload)
         if not accepted:
             return
+        if payload.get("type") == "audio.cancelled":
+            response_id = payload.get("response_id")
+            cancelled_epoch = payload.get("cancelled_epoch")
+            if isinstance(response_id, str) and isinstance(cancelled_epoch, int):
+                self.manager.invalidate_output(self.session.session_id, response_id, through_epoch=cancelled_epoch)
         self._emit_events(project_internal_event(self._require_projector(), payload))
         if deferred_overlap_payload is not None and not self._closing:
             precreate_response = self.model_state.deferred_precreate_response
@@ -3020,6 +3049,7 @@ class DuplexSessionRunner:
         # and append of the old epoch is dropped by the stale-epoch filter in
         # ``emit`` / the append tail, whatever the awaits below interleave with.
         new_epoch, old_playback = self._advance_barge_in_epoch(session)
+        self.manager.invalidate_output(session.session_id, old_response_id, through_epoch=old_epoch)
         if old_request_id is not None:
             # Release projector/parser cursors so cancelled epochs do not
             # accumulate until the whole session closes.

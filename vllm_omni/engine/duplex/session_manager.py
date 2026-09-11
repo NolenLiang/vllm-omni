@@ -11,8 +11,9 @@ state.
 Control operations (open / close / resume / touch) arrive as correlated RPC
 messages and answer through ``result_sink``; session commands arrive one-way
 as ``DuplexSessionCommandMessage`` and are pushed onto the runner's ordered
-mailbox after backpressure admission; everything a session emits leaves
-through ``output_sink`` as ``DuplexSessionEventMessage``.
+mailbox after backpressure admission. Public output uses a bounded buffer
+shared with that session's consumer. The engine-wide ``output_sink`` only
+carries closure notifications and errors without a live session.
 """
 
 from __future__ import annotations
@@ -34,7 +35,16 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_resource_request_belongs_to_session,
     duplex_resource_request_id,
 )
-from vllm_omni.engine.duplex.events import DuplexEvent, ErrorEvent, SessionClosed, SessionExpired, error_event
+from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer, DuplexOutputOverflowError
+from vllm_omni.engine.duplex.events import (
+    DuplexEvent,
+    ErrorEvent,
+    OutputAudioCleared,
+    ResponseDone,
+    SessionClosed,
+    SessionExpired,
+    error_event,
+)
 from vllm_omni.engine.duplex.lease import DuplexLeaseActivity, DuplexLeaseConfig, DuplexLeaseState
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
@@ -119,6 +129,8 @@ class DuplexSessionManager:
             disconnect_grace_s=runtime_config.disconnect_grace_s,
         )
         self.runners: dict[str, DuplexSessionRunner] = {}
+        self._outputs: dict[str, DuplexOutputBuffer] = {}
+        self._output_failed: set[str] = set()
         #: Sessions whose close/expiry began but whose stage cleanup has not finalized;
         #: they keep their admission slot until finalized.
         self._closing: dict[str, _PendingSessionCleanup] = {}
@@ -307,8 +319,13 @@ class DuplexSessionManager:
     # ------------------------------------------------------------------ #
 
     def emit(self, session: DuplexEngineSession, event: DuplexEvent) -> None:
-        """Bind the session identity to one typed event and push it to the engine output queue."""
+        """Bind identity and deliver through the session's bounded output."""
         self._emit_raw(session.session_id, event, epoch=session.epoch)
+
+    def invalidate_output(self, session_id: str, response_id: str | None, *, through_epoch: int) -> None:
+        output = self._outputs.get(session_id)
+        if output is not None and response_id is not None:
+            output.invalidate(response_id, through_epoch=through_epoch)
 
     def _emit_raw(
         self,
@@ -318,6 +335,30 @@ class DuplexSessionManager:
         epoch: int | None = None,
     ) -> None:
         event = replace(event, session_id=session_id, epoch=epoch)
+        output = self._outputs.get(session_id)
+        if output is not None and not isinstance(event, SessionClosed):
+            if isinstance(event, OutputAudioCleared) and epoch is not None:
+                self.invalidate_output(session_id, event.response_id, through_epoch=epoch)
+            if session_id in self._output_failed:
+                # The failure/close path has a finite reserve; stop adding ordinary output.
+                if not isinstance(event, ErrorEvent) and not (
+                    isinstance(event, ResponseDone) and event.status in {"failed", "cancelled"}
+                ):
+                    return
+            try:
+                output.put(event)
+            except DuplexOutputOverflowError as exc:
+                if session_id not in self._output_failed:
+                    self._output_failed.add(session_id)
+                    runner = self.runners.get(session_id)
+                    if runner is not None:
+                        runner.fail_output(str(exc))
+            return
+        if isinstance(event, SessionClosed):
+            self._outputs.pop(session_id, None)
+            self._output_failed.discard(session_id)
+        # Only closure notifications and errors without a live session use the
+        # engine-wide queue. Audio never accumulates there before the bounded buffer.
         message = DuplexSessionEventMessage(session_id=session_id, event=event)
         put_nowait = getattr(self._output_sink, "put_nowait", None)
         if callable(put_nowait):
@@ -485,6 +526,7 @@ class DuplexSessionManager:
                 model_config=self.model_config,
             )
             self.runners[session_id] = runner
+            self._outputs[session_id] = message.output_buffer
             # Reserve the Stage0 request resource atomically with admission.
             self.ensure_stage_request(session, stage_id=0)
             runner.start()
@@ -497,6 +539,7 @@ class DuplexSessionManager:
                 logger.exception("open_duplex_session failed: %s", exc)
             if runner is not None and self.runners.get(session_id) is runner:
                 self.runners.pop(session_id, None)
+                self._outputs.pop(session_id, None)
                 try:
                     await runner.shutdown()
                 except Exception:
