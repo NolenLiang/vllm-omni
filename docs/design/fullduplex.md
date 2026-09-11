@@ -192,7 +192,8 @@ command  handle.submit(DuplexCommand)
          -> engine.submit_command_async -> DuplexSessionCommandMessage on the request queue [one-way]
          -> DuplexSessionManager.dispatch: unknown_session / input_backpressure checks, then runner mailbox
 output   DuplexOrchestrator._intercept_stage_output -> runner.on_stage_output -> mailbox -> typed events
-         -> output_sink (DuplexSessionEventMessage) -> DuplexOmni._route_engine_message -> handle.events()
+         -> session's bounded output buffer -> handle.events(); closure still travels through
+            output_sink (DuplexSessionEventMessage) -> DuplexOmni._route_engine_message
 detach   DuplexOmni.detach_session -> touch(DETACH): engine-owned disconnect grace; expiry -> SessionExpired
 resume   DuplexOmni.resume_session(expected_lease_generation) -> lease CAS; the existing handle is re-entered
 close    DuplexOmni.close_session -> close RPC; the manager tears the runner down, then the stage cleanup
