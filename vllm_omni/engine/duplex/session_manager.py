@@ -882,6 +882,8 @@ class DuplexSessionManager:
         self._closing.clear()
         self._session_snapshots.clear()
         self._request_index.clear()
+        self._outputs.clear()
+        self._output_failed.clear()
         if self._owns_executor:
             self.executor.shutdown(wait=False, cancel_futures=True)
 
