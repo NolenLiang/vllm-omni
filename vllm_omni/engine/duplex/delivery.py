@@ -8,7 +8,8 @@ new stale model output; this buffer does not retain a growing response-id
 tombstone table. It tracks just the most recently dequeued event until the
 next ``get()`` so a consumer can recheck it immediately before delivery.
 
-Limits cover queued events, with a separate small termination reserve. A
+Limits cover queued events, with a separate small termination reserve and
+one final session-closure notification independent of that reserve. A
 consumer may additionally hold one dequeued event, at most one queue budget
 in size. Already journaled or delivered events are outside this buffer.
 """
@@ -21,9 +22,11 @@ import threading
 from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from vllm_omni.engine.duplex.events import AudioDelta, DuplexEvent, ErrorEvent, ResponseDone, SessionClosed
+
+_MAX_TERMINAL_BYTES = 4096
 
 
 class DuplexOutputOverflowError(RuntimeError):
@@ -68,6 +71,7 @@ class DuplexOutputBuffer:
         self._held_valid = True
         self._waiter: tuple[asyncio.AbstractEventLoop, asyncio.Future[None]] | None = None
         self._closed = False
+        self._terminal: SessionClosed | None = None
 
     @property
     def pending_bytes(self) -> int:
@@ -81,20 +85,32 @@ class DuplexOutputBuffer:
 
     @staticmethod
     def _can_use_reserve(event: DuplexEvent) -> bool:
-        return isinstance(event, ErrorEvent | SessionClosed | ResponseDone)
+        return isinstance(event, ErrorEvent | ResponseDone)
 
-    def put(self, event: DuplexEvent) -> None:
+    def put(self, event: DuplexEvent) -> bool:
         """Append without blocking; overflow leaves the queue unchanged.
 
-        Error and response/session terminals can use the finite reserve.
+        Return false for late output after closure. A session terminal closes
+        through its own single slot, even when the ordinary reserve is full.
+        Error and response terminals can use the finite reserve.
         They retain FIFO order and cannot overtake still-valid media. The
         caller must stop the affected session after ordinary overflow instead
         of repeatedly generating errors until the reserve also overflows.
         """
-        size = len(json.dumps(event.to_realtime(), ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        if isinstance(event, SessionClosed):
+            self.close(event)
+            return True
+        payload = event.to_realtime()
+        audio_size = 0
+        if isinstance(event, AudioDelta):
+            # The producer has already encoded this as base64 ASCII. Count it
+            # directly without serializing the large string or decoding PCM.
+            audio_size = len(event.delta)
+            payload["delta"] = ""
+        size = audio_size + len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
         with self._lock:
             if self._closed:
-                raise RuntimeError("duplex output buffer is closed")
+                return False
             reserved = self._bytes + size > self._max_bytes or self._events >= self._max_events
             if reserved and (
                 not self._can_use_reserve(event)
@@ -112,6 +128,7 @@ class DuplexOutputBuffer:
             waiter = self._waiter
             self._waiter = None
         self._notify(waiter)
+        return True
 
     @staticmethod
     def _matches(event: DuplexEvent, response_id: str, through_epoch: int) -> bool:
@@ -179,6 +196,10 @@ class DuplexOutputBuffer:
                     self._held_valid = True
                     return pending.event
                 if self._closed:
+                    if self._terminal is not None:
+                        terminal = self._terminal
+                        self._terminal = None
+                        return terminal
                     return None
                 if self._waiter is not None:
                     raise RuntimeError("duplex output buffer already has a waiting consumer")
@@ -191,10 +212,24 @@ class DuplexOutputBuffer:
                     if self._waiter is not None and self._waiter[1] is future:
                         self._waiter = None
 
-    def close(self) -> None:
-        """Reject further output and wake the consumer, preserving queued events."""
+    def close(self, event: SessionClosed | None = None) -> None:
+        """Finish once, preserving FIFO output before an optional final notification.
+
+        The single final slot cannot be consumed by errors or response endings.
+        Oversized close details are replaced by a compact notification retaining
+        the generated session/event identity and terminal type. Duplicate closure
+        and late output are harmless, including after a local
+        shutdown that already ended consumption without a session event.
+        """
+        if event is not None:
+            size = len(json.dumps(event.to_realtime(), ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+            if size > _MAX_TERMINAL_BYTES:
+                event = replace(event, reason="close_details_exceed_output_limit", details={})
         with self._lock:
+            if self._closed:
+                return
             self._closed = True
+            self._terminal = event
             waiter = self._waiter
             self._waiter = None
         self._notify(waiter)

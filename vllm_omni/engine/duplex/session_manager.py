@@ -357,6 +357,10 @@ class DuplexSessionManager:
         if isinstance(event, SessionClosed):
             self._outputs.pop(session_id, None)
             self._output_failed.discard(session_id)
+        elif not isinstance(event, ErrorEvent):
+            # A closed/rolled-back session must not move late audio back into
+            # the unbounded shared queue after its output buffer is removed.
+            return
         # Only closure notifications and errors without a live session use the
         # engine-wide queue. Audio never accumulates there before the bounded buffer.
         message = DuplexSessionEventMessage(session_id=session_id, event=event)

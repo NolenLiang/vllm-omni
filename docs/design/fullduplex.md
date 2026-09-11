@@ -232,13 +232,15 @@ Everything below runs on the orchestrator asyncio loop; there is no lock.
   on one loop in program order, nothing can be emitted for an old epoch after
   its terminal event; `runner.emit()` still drops a terminal carrying a stale
   epoch and stamps `epoch` on every event for clients that filter
-  defensively. This is a statement about order, not about latency: the engine
-  output queue and each `DuplexSessionHandle` outbox are unbounded and FIFO,
-  so a cancellation is delivered behind whatever audio was already emitted for
-  the response it cancels. A client that must stop quickly cancels its own
-  playback on `response.done` / `audio.cancelled` rather than waiting for the
-  stream to drain. Bounding those buffers and letting an accepted invalidation
-  skip undelivered media is left to the follow-up RFC.
+  defensively. In this experimental follow-up, public output goes directly to
+  one bounded buffer shared by the engine and `DuplexSessionHandle`. Accepted
+  cancellation removes queued `AudioDelta` events for that response through
+  the cancelled epoch. Text increments, audio/transcript completion markers,
+  other responses and normal completion retain FIFO order. The consumer also
+  checks an event already taken from the buffer: WebSocket delivery repeats
+  that check under the connection lock, before sequencing and journaling.
+  Already sequenced replay entries are unchanged; already delivered audio
+  still requires the client to stop its own playback.
 - **Backpressure before the mailbox.** `DuplexSessionManager.dispatch`
   checks `max_pending_input_bytes_per_session` and reserves a pending turn for
   `Commit` before the put; a rejected command is answered with
@@ -248,6 +250,32 @@ Everything below runs on the orchestrator asyncio loop; there is no lock.
   accumulates the snapshot into the active response, so
   `ResponseDone.stage_metrics` and `metadata.vllm_omni.stage_metrics` on the
   wire keep their meaning.
+
+### Experimental output limits
+
+`max_pending_output_bytes_per_session` defaults to 2 MiB and
+`max_pending_output_events_per_session` to 512. The byte limit counts compact
+Realtime JSON, including base64 audio, not decoded PCM or Python object
+overhead. Audio is already base64-encoded by the producer; counting its length
+avoids serializing or decoding that large field again. Neither default has
+been tuned from a performance study.
+
+Errors and response endings have an additional 64 KiB / eight-event reserve
+and retain FIFO order. One final session-closure notification has an independent
+slot, so an exhausted reserve cannot prevent closure or break delivery to
+other sessions. Oversized close details (over 4 KiB with generated identity)
+are replaced by a compact reason, preserving terminal type and identity.
+Late writes after closure are ignored; a locally ended iterator is not reopened
+by a late terminal. One event held by the consumer is outside the queued budget.
+
+The provisional overflow policy fails the active response and closes only the
+affected session. Response-only recovery remains a design question, not an
+implemented or agreed policy. These limits do not bound the runner's raw stage
+output mailbox, replay journal, or client playback queues. The shared buffer
+requires the current same-process, separate-thread engine arrangement; it is
+not a cross-process delivery protocol. Direct handle iteration and WebSocket
+delivery share buffer validity, but end-to-end client behavior still needs
+independent real-model verification.
 
 ## Orchestrator seams
 
