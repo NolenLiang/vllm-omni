@@ -362,6 +362,7 @@ class DuplexOmni(AsyncOmniBase):
                 session_id, session_config, output_buffer=handle._outbox, timeout=timeout
             )
         except BaseException:
+            handle._mark_closed("open_failed")
             if self._handles.get(session_id) is handle:
                 self._handles.pop(session_id, None)
             raise
