@@ -24,7 +24,8 @@ async def test_cancel_removes_only_matching_audio_and_invalidates_held_audio():
         output.put(event)
     assert await output.get() is held
     assert output.is_valid(held)
-    assert output.invalidate("old", through_epoch=0) == 1
+    output.invalidate("old", through_epoch=0)
+    assert output.pending_events == 4
     with output.guard(held) as valid:
         assert not valid
     assert [await output.get() for _ in range(4)] == [text, other, newer, done]
