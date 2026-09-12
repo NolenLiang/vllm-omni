@@ -135,8 +135,8 @@ class DuplexOutputBuffer:
             and event.epoch <= through_epoch
         )
 
-    def invalidate(self, response_id: str, through_epoch: int) -> int:
-        """Remove queued audio for one accepted cancellation, returning its count.
+    def invalidate(self, response_id: str, through_epoch: int) -> None:
+        """Remove queued audio for one accepted cancellation.
 
         Non-audio events and other responses retain their exact order. An
         already dequeued matching event becomes invalid too. The producer
@@ -144,17 +144,14 @@ class DuplexOutputBuffer:
         """
         with self._lock:
             kept: deque[_PendingEvent] = deque()
-            removed = 0
             for pending in self._pending:
                 if self._matches(pending.event, response_id, through_epoch):
                     self._release(pending)
-                    removed += 1
                 else:
                     kept.append(pending)
             self._pending = kept
             if self._held is not None and self._matches(self._held, response_id, through_epoch):
                 self._held = None
-            return removed
 
     def _is_valid(self, event: DuplexEvent) -> bool:
         return not isinstance(event, AudioDelta) or event is self._held
