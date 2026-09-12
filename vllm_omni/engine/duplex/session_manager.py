@@ -269,20 +269,24 @@ class DuplexSessionManager:
         if runner is None:
             self._emit_raw(
                 message.session_id,
-                self._error_event(
-                    "unknown_session",
-                    f"Unknown or closed duplex session: {message.session_id}",
-                    command=command,
-                ),
+                [
+                    self._error_event(
+                        "unknown_session",
+                        f"Unknown or closed duplex session: {message.session_id}",
+                        command=command,
+                    )
+                ],
             )
             return
         session = runner.session
         if runner.closing:
             self.emit(
                 session,
-                self._error_event(
-                    "session_closed", f"Duplex session is closing: {session.session_id}", command=command
-                ),
+                [
+                    self._error_event(
+                        "session_closed", f"Duplex session is closing: {session.session_id}", command=command
+                    )
+                ],
             )
             return
         if isinstance(command, AppendAudio):
@@ -290,22 +294,26 @@ class DuplexSessionManager:
             if not session.reserve_input_bytes(len(command.audio), limit=limit):
                 self.emit(
                     session,
-                    self._error_event(
-                        "input_backpressure",
-                        "Duplex session has too many pending input bytes",
-                        command=command,
-                    ),
+                    [
+                        self._error_event(
+                            "input_backpressure",
+                            "Duplex session has too many pending input bytes",
+                            command=command,
+                        )
+                    ],
                 )
                 return
         elif isinstance(command, Commit):
             if not session.reserve_pending_turn(limit=int(self.runtime_config.max_pending_turns_per_session)):
                 self.emit(
                     session,
-                    self._error_event(
-                        "input_backpressure",
-                        "Duplex session has too many pending input turns",
-                        command=command,
-                    ),
+                    [
+                        self._error_event(
+                            "input_backpressure",
+                            "Duplex session has too many pending input turns",
+                            command=command,
+                        )
+                    ],
                 )
                 return
         runner.submit(command)
@@ -318,9 +326,9 @@ class DuplexSessionManager:
     # Emission                                                           #
     # ------------------------------------------------------------------ #
 
-    def emit(self, session: DuplexEngineSession, event: DuplexEvent) -> None:
+    def emit(self, session: DuplexEngineSession, events: list[DuplexEvent]) -> None:
         """Bind identity and deliver through the session's bounded output."""
-        self._emit_raw(session.session_id, event, epoch=session.epoch)
+        self._emit_raw(session.session_id, events, epoch=session.epoch)
 
     def invalidate_output(self, session_id: str, response_id: str | None, *, through_epoch: int) -> None:
         output = self._outputs.get(session_id)
@@ -330,10 +338,38 @@ class DuplexSessionManager:
     def _emit_raw(
         self,
         session_id: str,
-        event: DuplexEvent,
+        events: list[DuplexEvent],
         *,
         epoch: int | None = None,
     ) -> None:
+        ending_delivered = False
+        for index, event in enumerate(events):
+            try:
+                self._deliver(session_id, event, epoch=epoch)
+            except DuplexOutputOverflowError as exc:
+                if session_id in self._output_failed:
+                    return
+                self._output_failed.add(session_id)
+                runner = self.runners.get(session_id)
+                if runner is None:
+                    return
+                # Projection has already marked this batch's ending as emitted.
+                # Retain it instead of recursively projecting a second ending.
+                terminal = next((item for item in events[index:] if isinstance(item, ResponseDone)), None)
+                response_id = terminal.response_id if terminal is not None else event.response_id
+                if response_id is None and not ending_delivered:
+                    response_id = runner.session.active_response_id
+                for recovery in runner.fail_output(str(exc), response_id=response_id, terminal=terminal):
+                    try:
+                        self._deliver(session_id, recovery, epoch=epoch)
+                    except DuplexOutputOverflowError:
+                        # A full control reserve may omit an error/response ending;
+                        # session closure still has its independent terminal slot.
+                        pass
+                return
+            ending_delivered |= isinstance(event, ResponseDone)
+
+    def _deliver(self, session_id: str, event: DuplexEvent, *, epoch: int | None) -> None:
         event = replace(event, session_id=session_id, epoch=epoch)
         output = self._outputs.get(session_id)
         if output is not None and not isinstance(event, SessionClosed):
@@ -345,14 +381,7 @@ class DuplexSessionManager:
                     isinstance(event, ResponseDone) and event.status in {"failed", "cancelled"}
                 ):
                     return
-            try:
-                output.put(event)
-            except DuplexOutputOverflowError as exc:
-                if session_id not in self._output_failed:
-                    self._output_failed.add(session_id)
-                    runner = self.runners.get(session_id)
-                    if runner is not None:
-                        runner.fail_output(str(exc))
+            output.put(event)
             return
         if isinstance(event, SessionClosed):
             self._outputs.pop(session_id, None)
@@ -646,7 +675,7 @@ class DuplexSessionManager:
                 terminal: DuplexEvent = (
                     SessionExpired(reason=reason) if kind == "expired" else SessionClosed(reason=reason)
                 )
-                self.emit(session, terminal)
+                self.emit(session, [terminal])
 
     async def _finalize_pending_cleanup(
         self,
