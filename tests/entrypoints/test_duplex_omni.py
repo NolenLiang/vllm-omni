@@ -181,6 +181,32 @@ async def test_events_are_routed_to_their_handle_and_end_on_session_closed(monke
 
 
 @pytest.mark.asyncio
+async def test_events_skips_audio_invalidated_after_dequeue(monkeypatch) -> None:
+    omni, engine = _make_omni(monkeypatch)
+    try:
+        handle = await omni.open_session()
+        output = engine.outputs[handle.session_id]
+        original_get = output.get
+
+        async def get_then_invalidate() -> DuplexEvent | None:
+            event = await original_get()
+            if isinstance(event, AudioDelta) and event.response_id == "cancelled":
+                output.invalidate("cancelled", through_epoch=0)
+            return event
+
+        monkeypatch.setattr(output, "get", get_then_invalidate)
+        engine.emit(handle.session_id, AudioDelta(response_id="cancelled", epoch=0, delta="old"))
+        engine.emit(handle.session_id, AudioDelta(response_id="current", epoch=1, delta="new"))
+
+        events = await _collect(handle, 1)
+
+        assert isinstance(events[0], AudioDelta)
+        assert events[0].response_id == "current" and events[0].delta == "new"
+    finally:
+        omni.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_events_is_single_consumer_but_may_be_reentered(monkeypatch) -> None:
     omni, engine = _make_omni(monkeypatch)
     try:

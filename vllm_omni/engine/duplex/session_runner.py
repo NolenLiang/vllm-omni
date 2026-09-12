@@ -82,6 +82,7 @@ from vllm_omni.engine.duplex.events import (
     InputCleared,
     OverlapDecision,
     PlaybackAcknowledged,
+    ResponseDone,
     SessionExpired,
     SessionHeartbeatAck,
     error_event,
@@ -353,29 +354,52 @@ class DuplexSessionRunner:
         """Whether ``session.closed`` / ``session.expired`` already left this runner."""
         return self._closed_emitted
 
-    def fail_output(self, message: str) -> None:
+    def fail_output(self, message: str, *, response_id: str | None, terminal: ResponseDone | None) -> list[DuplexEvent]:
         """Experimental overflow policy: fail this response and close only its session."""
         if self.closing:
-            return
+            return []
         session = self.session
-        response_id = session.active_response_id
         self.manager.invalidate_output(session.session_id, response_id, through_epoch=session.epoch)
-        self._emit_error("output_backpressure", message)
+        if session.active_response_id is not None:
+            # Close still needs the request binding to abort the real engine work.
+            session.end_response(commit_text=False, preserve_request=True)
+        events: list[DuplexEvent] = [error_event("output_backpressure", message)]
         if response_id is not None:
-            self.emit(
-                {
-                    "type": "response.done",
-                    "session_id": session.session_id,
-                    "response_id": response_id,
-                    "epoch": session.epoch,
-                    "committed": False,
-                    "status": "failed",
-                    "status_details": {"type": "failed", "reason": "output_backpressure"},
-                    "playback": session.playback.as_dict(),
-                }
-            )
+            # Normal completion can commit just before its projected ending is
+            # delivered. An ending converted to failure must undo that commit.
+            session.delete_history_item(f"item_{response_id}")
+            payload = {
+                "type": "response.done",
+                "session_id": session.session_id,
+                "response_id": response_id,
+                "epoch": session.epoch,
+                "committed": False,
+                "status": "failed",
+                "status_details": {"type": "failed", "reason": "output_backpressure"},
+                "playback": session.playback.as_dict(),
+            }
+            if terminal is None:
+                projected = project_internal_event(self._require_projector(), payload)
+                terminal = next((event for event in projected if isinstance(event, ResponseDone)), None)
+            else:
+                response = dict(terminal.response)
+                metadata = response.get("metadata")
+                response.update(
+                    status="failed",
+                    status_details=payload["status_details"],
+                    metadata={**(metadata if isinstance(metadata, Mapping) else {}), **payload},
+                )
+                output = response.get("output")
+                if isinstance(output, list):
+                    response["output"] = [
+                        {**item, "status": "failed"} if isinstance(item, Mapping) else item for item in output
+                    ]
+                terminal = replace(terminal, response=response)
+            if terminal is not None:
+                events.append(terminal)
         self._begin_close("output_backpressure")
         self.manager.close_from_runner(self, "output_backpressure")
+        return events
 
     @property
     def closing(self) -> bool:
@@ -701,8 +725,7 @@ class DuplexSessionRunner:
         return self._projector
 
     def _emit_events(self, events: list[DuplexEvent]) -> None:
-        for event in events:
-            self.manager.emit(self.session, event)
+        self.manager.emit(self.session, events)
 
     def _emit_error(
         self,
@@ -2311,7 +2334,7 @@ class DuplexSessionRunner:
         expected_epoch: int | None = None,
     ) -> tuple[str | None, bool]:
         session = self.session
-        if expected_epoch is not None and session.epoch != expected_epoch:
+        if self.closing or (expected_epoch is not None and session.epoch != expected_epoch):
             return None, False
         close_reason: str | None = None
         emitted_response = False
@@ -2328,7 +2351,7 @@ class DuplexSessionRunner:
             )
             emitted_response = emitted_response or did_emit
             close_reason = close_reason or close_reason_for_result
-            if expected_epoch is not None and session.epoch != expected_epoch:
+            if self.closing or (expected_epoch is not None and session.epoch != expected_epoch):
                 return None, emitted_response
         return close_reason, emitted_response
 
@@ -2360,6 +2383,8 @@ class DuplexSessionRunner:
                 str(model_result.get("error_code")),
                 str(model_result.get("error") or "Duplex native data-plane error"),
             )
+            if self.closing:
+                return close_reason, emitted_response
             if response_id is not None:
                 session.end_response(commit_text=False)
                 self.emit(
@@ -2408,6 +2433,8 @@ class DuplexSessionRunner:
             return close_reason, emitted_response
         if is_listen is True:
             self._end_active_response_before_future_model_turn(model_turn_id=model_turn_id)
+            if self.closing:
+                return close_reason, emitted_response
             if (
                 session.active_response_id is not None
                 and model_turn_id is not None
@@ -2448,6 +2475,8 @@ class DuplexSessionRunner:
                 payload["response_id"] = response_id
             self._attach_runtime_metadata(payload, model_result)
             self.emit(payload)
+            if self.closing:
+                return close_reason, emitted_response
             if model_result.get("abort_data_plane_request") is True and isinstance(data_plane_request_id, str):
                 await self._abort_request_background(data_plane_request_id, notify=False)
             if response_id is not None:
@@ -2519,6 +2548,8 @@ class DuplexSessionRunner:
             # Late audio of a completed model turn must not reserve a second response.
             return close_reason, emitted_response
         self._end_active_response_before_future_model_turn(model_turn_id=model_turn_id)
+        if self.closing:
+            return close_reason, emitted_response
         if (
             session.active_response_id is not None
             and model_turn_id is not None
@@ -2532,6 +2563,8 @@ class DuplexSessionRunner:
             response_id = session.begin_response(turn_id=model_turn_id)
             response_created = True
             self.emit(self._response_created_payload(response_id, epoch=session.epoch))
+            if self.closing:
+                return close_reason, emitted_response
         response_stage_metrics = session.accumulate_response_stage_metrics(
             model_result.get("stage_metrics") if isinstance(model_result.get("stage_metrics"), Mapping) else None
         )
@@ -2547,6 +2580,8 @@ class DuplexSessionRunner:
             }
             self._attach_runtime_metadata(speak_payload, model_result, stage_metrics=response_stage_metrics)
             self.emit(speak_payload)
+            if self.closing:
+                return close_reason, emitted_response
         previous_sent_ms = session.playback.sent_ms
         text_chars_before_append = len("".join(session.assistant_text_buffer))
         if isinstance(text, str):
@@ -2608,6 +2643,8 @@ class DuplexSessionRunner:
             payload["sample_rate_hz"] = int(sample_rate_hz)
         self._attach_runtime_metadata(payload, model_result, stage_metrics=response_stage_metrics)
         self.emit(payload)
+        if self.closing:
+            return close_reason, emitted_response
         if (
             not end_of_turn
             and model_result.get("stage_role") == "tts"

@@ -36,6 +36,7 @@ from vllm_omni.engine.duplex.events import (
     SessionCreated,
     SessionExpired,
     SessionHeartbeatAck,
+    TranscriptDelta,
 )
 from vllm_omni.engine.duplex.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.messages import (
@@ -394,6 +395,22 @@ class Harness:
         session = self.manager.get(session_id)
         assert session is not None
         return session
+
+    async def begin_output_response(self, session_id: str) -> str:
+        """Initialize real response, text and audio projection before filling output."""
+        runner = self.manager.runners[session_id]
+        response_id = runner.session.begin_response()
+        runner.session.append_assistant_text("abcdefghij")
+        payloads: list[dict[str, object]] = [
+            {"type": "response.created", "modalities": ["audio", "text"]},
+            {"type": "response.text.delta", "delta": "abcdefghij"},
+            {"type": "response.output_audio.delta", "audio": "AAAAAA==", "format": "pcm16"},
+        ]
+        for payload in payloads:
+            runner.emit({**payload, "response_id": response_id, "epoch": runner.session.epoch})
+            await self.events(session_id)
+        assert not runner.closing
+        return response_id
 
     def capture_submissions(self, session_id: str) -> list[DuplexCommand]:
         """Replace the runner mailbox with a list so admitted commands can be inspected."""
@@ -1541,7 +1558,7 @@ async def test_reaper_loop_survives_one_cleanup_failure(first_cleanup_delay: flo
         await asyncio.wait_for(task, timeout=5.0)
 
 
-async def test_output_overflow_closes_only_its_session_and_releases_capacity() -> None:
+async def test_output_overflow_closes_only_its_session_and_releases_capacity(mocker) -> None:
     async with Harness.create(max_sessions=2, max_pending_output_events_per_session=8) as harness:
         assert (await harness.open("slow")).ok
         assert (await harness.open("normal")).ok
@@ -1550,20 +1567,42 @@ async def test_output_overflow_closes_only_its_session_and_releases_capacity() -
         assert not harness.manager.runners["normal"].closing
         slow = harness.session("slow")
         normal = harness.session("normal")
-        slow_response = slow.begin_response()
+        slow_response = await harness.begin_output_response("slow")
         normal_response = normal.begin_response()
+        request_id = stage0_request_id("slow")
+        slow.bind_request(request_id)
+        slow.mark_audio_sent(1000)
+        slow.acknowledge_playback(500, 500)
+        close_stream = mocker.spy(harness.plugin.data_plane, "close_stream")
 
-        for _ in range(9):
-            harness.manager.emit(slow, AudioDelta(response_id=slow_response, delta="AAAA"))
-        harness.manager.emit(normal, AudioDelta(response_id=normal_response, delta="CCCC"))
+        for _ in range(5):
+            harness.manager.runners["slow"].emit(
+                {
+                    "type": "response.output_audio.delta",
+                    "response_id": slow_response,
+                    "audio": "AAAAAA==",
+                    "format": "pcm16",
+                }
+            )
+        harness.manager.emit(normal, [AudioDelta(response_id=normal_response, delta="CCCC")])
         await asyncio.wait_for(asyncio.gather(*tuple(harness.manager._dispatched_control_tasks)), timeout=2.0)
 
         events = await harness.events()
         failed = [event for event in events if event.session_id == "slow"]
-        assert [type(event) for event in failed] == [ErrorEvent, ResponseDone, SessionClosed]
-        assert failed[0].code == "output_backpressure"
-        assert failed[1].response_id == slow_response and failed[1].status == "failed"
-        assert failed[2].reason == "output_backpressure"
+        # Queued transcript deltas remain ordered; stale audio and the failed
+        # response's undelivered completion markers are discarded.
+        assert [type(event) for event in failed] == [TranscriptDelta] * 4 + [ErrorEvent, ResponseDone, SessionClosed]
+        assert failed[-3].code == "output_backpressure"
+        done = failed[-2]
+        assert isinstance(done, ResponseDone)
+        assert done.response_id == slow_response and done.status == "failed"
+        metadata = done.response["metadata"]
+        assert isinstance(metadata, dict) and metadata["committed"] is False
+        assert failed[-1].reason == "output_backpressure"
+        assert slow.history == []
+        assert slow.active_response_id is None
+        assert harness.stage_port.abort_calls == [[request_id]]
+        close_stream.assert_called_once_with(request_id)
         delivered = [event for event in events if event.session_id == "normal"]
         assert len(delivered) == 1 and isinstance(delivered[0], AudioDelta)
         assert delivered[0].response_id == normal_response and delivered[0].delta == "CCCC"
@@ -1571,3 +1610,73 @@ async def test_output_overflow_closes_only_its_session_and_releases_capacity() -
         assert harness.manager.get("normal") is normal
         assert harness.manager.active_count() == 1
         assert (await harness.open("replacement")).ok
+
+
+@pytest.mark.parametrize(
+    "capacity,end_before_emit,expected_status,closed",
+    [
+        (8, True, "failed", True),
+        (8, False, "failed", True),
+        (14, True, "completed", True),
+        (64, True, "completed", False),
+    ],
+    ids=["already-ended-overflow", "active-overflow", "overflow-after-ending", "sufficient-capacity"],
+)
+async def test_completion_projection_retains_exactly_one_response_done(
+    capacity: int, end_before_emit: bool, expected_status: str, closed: bool
+) -> None:
+    async with Harness.create(max_pending_output_events_per_session=capacity) as harness:
+        assert (await harness.open("completion")).ok
+        await harness.events()
+        response_id = await harness.begin_output_response("completion")
+        runner = harness.manager.runners["completion"]
+        for _ in range(4):
+            runner.emit(
+                {
+                    "type": "response.output_audio.delta",
+                    "response_id": response_id,
+                    "audio": "AAAAAA==",
+                    "format": "pcm16",
+                }
+            )
+        assert harness.outputs["completion"].pending_events == 8
+        runner.session.mark_audio_sent(1000)
+        runner.session.acknowledge_playback(500, 500)
+        if end_before_emit:
+            message = runner.session.end_response(commit_text=True)
+            assert message == {"role": "assistant", "content": "abcde"}
+            runner.session.register_history_item(f"item_{response_id}", message)
+            assert runner.session.history == [message]
+
+        runner.emit(
+            {"type": "response.done", "response_id": response_id, "status": "completed", "committed": end_before_emit}
+        )
+        await asyncio.wait_for(asyncio.gather(*tuple(harness.manager._dispatched_control_tasks)), timeout=2.0)
+
+        events = await harness.events()
+        endings = [event for event in events if isinstance(event, ResponseDone)]
+        assert len(endings) == 1
+        assert endings[0].response_id == response_id and endings[0].status == expected_status
+        metadata = endings[0].response["metadata"]
+        assert isinstance(metadata, dict) and metadata["committed"] is (expected_status == "completed")
+        assert any(isinstance(event, SessionClosed) for event in events) is closed
+        if expected_status == "failed":
+            assert [type(event) for event in events] == [TranscriptDelta] * 4 + [
+                ErrorEvent,
+                ResponseDone,
+                SessionClosed,
+            ]
+            assert endings[0].response["status_details"] == {"type": "failed", "reason": "output_backpressure"}
+            assert runner.session.history == []
+        else:
+            assert [type(event) for event in events[:8]] == [AudioDelta, TranscriptDelta] * 4
+            assert runner.session.history == [{"role": "assistant", "content": "abcde"}]
+            if closed:
+                # The ending was accepted; overflowing on rate_limits.updated
+                # must not replace it, emit a second ending or undo its history.
+                assert [type(event) for event in events[-3:]] == [ResponseDone, ErrorEvent, SessionClosed]
+                assert events[-3] is endings[0]
+            else:
+                assert not any(isinstance(event, ErrorEvent) for event in events)
+                assert events[-2] is endings[0]
+                assert events[-1].type == "rate_limits.updated"
