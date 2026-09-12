@@ -1599,7 +1599,7 @@ async def test_output_overflow_closes_only_its_session_and_releases_capacity(moc
         metadata = done.response["metadata"]
         assert isinstance(metadata, dict) and metadata["committed"] is False
         assert failed[-1].reason == "output_backpressure"
-        assert slow.history == []
+        assert slow.history == ()
         assert slow.active_response_id is None
         assert harness.stage_port.abort_calls == [[request_id]]
         close_stream.assert_called_once_with(request_id)
@@ -1646,7 +1646,7 @@ async def test_completion_projection_retains_exactly_one_response_done(
             message = runner.session.end_response(commit_text=True)
             assert message == {"role": "assistant", "content": "abcde"}
             runner.session.register_history_item(f"item_{response_id}", message)
-            assert runner.session.history == [message]
+            assert runner.session.history == (message,)
 
         runner.emit(
             {"type": "response.done", "response_id": response_id, "status": "completed", "committed": end_before_emit}
@@ -1667,10 +1667,10 @@ async def test_completion_projection_retains_exactly_one_response_done(
                 SessionClosed,
             ]
             assert endings[0].response["status_details"] == {"type": "failed", "reason": "output_backpressure"}
-            assert runner.session.history == []
+            assert runner.session.history == ()
         else:
             assert [type(event) for event in events[:8]] == [AudioDelta, TranscriptDelta] * 4
-            assert runner.session.history == [{"role": "assistant", "content": "abcde"}]
+            assert runner.session.history == ({"role": "assistant", "content": "abcde"},)
             if closed:
                 # The ending was accepted; overflowing on rate_limits.updated
                 # must not replace it, emit a second ending or undo its history.
