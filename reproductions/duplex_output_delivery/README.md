@@ -57,4 +57,21 @@ Cancellation submission is not the exact instant the engine accepts it. Delibera
 A returned ASGI send call establishes server-send acceptance, not network delivery or physical speaker playback. Already-sent audio still requires client-side playback cancellation.
 In the completed held-send pair, baseline old audio after cancel submission was eight chunks / 384,000 decoded bytes; candidate old audio was zero. Both other responses produced 101 chunks after the cancelled terminal and completed. These are single runs, not performance results. Both versions reported shared-memory cleanup warnings on shutdown; leak-free cleanup is not established.
 
+## Output-limit closure through direct Python handles
+
+From the candidate checkout, use the companion `inline_overflow_probe.py`:
+
+```bash
+python3 ../inline_overflow_probe.py \
+  --model ../models/MiniCPM-o-4_5 \
+  --deploy-config vllm_omni/deploy/minicpmo_4_5.yaml \
+  --result-dir ../results/candidate-overflow
+```
+
+The script inherits the model deployment and overrides only the session limit (two), queued output bytes (768 KiB), and queued event count (512). The production default remains 2 MiB. The reference audio must be present under the local model's `assets/HT_ref_audio.wav`; opening messages include it, so an artificially small limit can fail before generation even starts.
+
+The slow reader stops after its first audio event; no cancel or close is sent to trigger the overflow. Normal input starts afterwards to keep its response active across closure. Require `output_backpressure`, a failed ending for the slow response, then `session.closed`, followed by audio from the same normal response. A new session must occupy the released slot and produce audio with distinct session and response IDs.
+
+The completed candidate run observed nine normal-response chunks during the pause and three after automatic closure. Active sessions returned to two when the replacement produced its first audio. Normal and replacement sessions were explicitly closed afterwards; natural completion of those responses is not claimed. This is a single direct-handle run, not a WebSocket overflow or physical-playback measurement. Shared-memory cleanup warnings remained at shutdown.
+
 AI assistance: Codex helped with the observer, checks and documentation.
