@@ -2,14 +2,46 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
+import json
 from dataclasses import replace
 
 import pytest
 
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer, DuplexOutputOverflowError
 from vllm_omni.engine.duplex.events import AudioDelta, ResponseDone, SessionClosed, TranscriptDelta
+from vllm_omni.engine.duplex.realtime_events import RealtimeProjectionState, project_internal_event
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("event_type", "delta_field", "content_field"),
+    [
+        ("response.text.delta", "delta", "text"),
+        ("response.output_audio.delta", "text", "transcript"),
+    ],
+)
+async def test_queued_response_creation_keeps_payload_and_byte_count(event_type, delta_field, content_field):
+    state = RealtimeProjectionState(session_id="s")
+    events = project_internal_event(state, {"type": "response.created", "response_id": "r", "modalities": ["text"]})
+    payloads = [event.to_realtime() for event in events]
+    byte_count = sum(
+        len(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()) for payload in payloads
+    )
+    output = DuplexOutputBuffer(max_bytes=byte_count, max_events=len(events))
+    for event in events:
+        output.put(event)
+    assert output.pending_bytes == byte_count
+
+    text = "Growing response. " * 512
+    project_internal_event(state, {"type": event_type, "response_id": "r", delta_field: text})
+    item = next(iter(state.conversation_items.values()))
+    assert item["content"][0][content_field] == text
+    assert output.pending_bytes == byte_count
+    delivered = [await output.get() for _ in events]
+    assert [event.to_realtime() for event in delivered] == payloads
+    assert output.pending_events == output.pending_bytes == 0
 
 
 @pytest.mark.asyncio
