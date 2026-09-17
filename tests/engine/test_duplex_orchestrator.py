@@ -556,6 +556,7 @@ async def test_turn_plugin_processes_multimodal_prompt_before_stage_submission(m
             control_id="open-qwen",
             session_id=SESSION_ID,
             session_config=DuplexSessionConfig(model="qwen", modalities=["text", "audio"]),
+            output_buffer=DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512),
         )
     )
     assert (await rpc_q.get()).ok
