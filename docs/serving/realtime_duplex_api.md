@@ -1150,6 +1150,18 @@ the requested position and audio duration; this is not exact word alignment.
 {"type": "output_audio_buffer.cleared", "response_id": "resp_01"}
 ```
 
+Under `ack_only`, clearing the latest completed response releases its remaining
+playback wait and advances the epoch. Buffered and retained committed user input
+are preserved. If a deferred audio commit requested a response, it starts
+automatically; otherwise, the client must still send `response.create`.
+Send the last playback ACK before
+clearing: the acknowledged position caps the existing history-truncation rule,
+and a late ACK cannot restore the discarded portion.
+
+Clearing an older completed response does not interrupt a newer response.
+A completed response with no ACK-only playback wait (including
+`commit_all_on_done`) is only acknowledged; it does not cancel new input work.
+
 `C→S barge_in` / `turn.signal`
 
 ```json

@@ -1317,10 +1317,12 @@ def resolve_cancel_response(state: RealtimeProjectionState, command: CancelRespo
     return ResolvedControl(payloads=[payload], events=[])
 
 
-def resolve_clear_output_audio(state: RealtimeProjectionState, command: ClearOutputAudio) -> ResolvedControl:
+def resolve_clear_output_audio(
+    state: RealtimeProjectionState, command: ClearOutputAudio, *, playback_active: bool = False
+) -> ResolvedControl:
     payload: dict[str, object] = {"type": "output_audio_buffer.clear", "reason": "output_audio_buffer.clear"}
     response_id = command.response_id or state.active_response_id or state.last_response_id
-    if response_is_done(state, response_id):
+    if response_is_done(state, response_id) and (not playback_active or response_id != state.last_response_id):
         return ResolvedControl(payloads=[], events=[OutputAudioCleared(response_id=_str_or_none(response_id))])
     if isinstance(response_id, str) and response_id:
         payload["response_id"] = response_id
