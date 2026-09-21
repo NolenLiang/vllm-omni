@@ -7,9 +7,10 @@ from __future__ import annotations
 
 import asyncio
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, call
+from unittest.mock import AsyncMock
 
 import pytest
+from pytest_mock import MockerFixture
 from vllm.outputs import RequestOutput
 
 from vllm_omni.engine.stage_client import StagePoolLLMClient
@@ -130,7 +131,7 @@ def test_abort_requests_does_not_commit_op_state_when_engine_abort_fails():
     asyncio.run(run())
 
 
-def _make_cleanup_pool(*, engine_ids: list[str] | None = None):
+def _make_cleanup_pool(mocker: MockerFixture, *, engine_ids: list[str] | None = None):
     output = RequestOutput(
         request_id="engine-1",
         prompt=None,
@@ -139,12 +140,12 @@ def _make_cleanup_pool(*, engine_ids: list[str] | None = None):
         outputs=[],
         finished=True,
     )
-    processor = Mock(spec=MultimodalOutputProcessor)
+    processor = mocker.Mock(spec=MultimodalOutputProcessor)
     processor.abort_requests_collecting_outputs.return_value = (
         ["engine-1"] if engine_ids is None else engine_ids,
         [output],
     )
-    client = Mock(spec=StagePoolLLMClient, stage_type="llm")
+    client = mocker.Mock(spec=StagePoolLLMClient, stage_type="llm")
     client.call_utility_async.return_value = True
     pool = StagePool(0, [client], output_processor=processor)
     pool._request_bindings["req-1"] = 0
@@ -153,8 +154,8 @@ def _make_cleanup_pool(*, engine_ids: list[str] | None = None):
 
 @pytest.mark.cpu
 @pytest.mark.parametrize("engine_ids", [["engine-1"], []])
-def test_prepare_request_cleanup_retains_route_and_noncommitting_snapshot(engine_ids):
-    pool, client, processor, output = _make_cleanup_pool(engine_ids=engine_ids)
+def test_prepare_request_cleanup_retains_route_and_noncommitting_snapshot(engine_ids, mocker: MockerFixture):
+    pool, client, processor, output = _make_cleanup_pool(mocker, engine_ids=engine_ids)
 
     plan = pool.prepare_request_cleanup("req-1")
 
@@ -170,8 +171,8 @@ def test_prepare_request_cleanup_retains_route_and_noncommitting_snapshot(engine
 
 
 @pytest.mark.cpu
-def test_prepare_request_cleanup_requires_exact_live_binding():
-    pool, _client, processor, _output = _make_cleanup_pool()
+def test_prepare_request_cleanup_requires_exact_live_binding(mocker: MockerFixture):
+    pool, _client, processor, _output = _make_cleanup_pool(mocker)
     with pytest.raises(StageUnavailableError, match="No live cleanup route"):
         pool.prepare_request_cleanup("unknown")
     pool.mark_replica_unavailable(0)
@@ -183,9 +184,9 @@ def test_prepare_request_cleanup_requires_exact_live_binding():
 @pytest.mark.cpu
 @pytest.mark.parametrize("phase", ["drain", "reclaim", "release"])
 @pytest.mark.parametrize("route_change", ["unavailable", "replaced"])
-def test_request_cleanup_never_reselects_original_route(phase, route_change):
+def test_request_cleanup_never_reselects_original_route(phase, route_change, mocker: MockerFixture):
     async def run() -> None:
-        pool, client, _processor, _output = _make_cleanup_pool()
+        pool, client, _processor, _output = _make_cleanup_pool(mocker)
         plan = pool.prepare_request_cleanup("req-1")
         if phase in {"reclaim", "release"}:
             await pool.drain_request_cleanup(plan, "cancel-1")
@@ -195,7 +196,7 @@ def test_request_cleanup_never_reselects_original_route(phase, route_change):
         if route_change == "unavailable":
             pool.mark_replica_unavailable(0)
         else:
-            pool.clients[0] = Mock(spec=StagePoolLLMClient, stage_type="llm")
+            pool.clients[0] = mocker.Mock(spec=StagePoolLLMClient, stage_type="llm")
         with pytest.raises(StageUnavailableError, match="Original cleanup route unavailable"):
             await getattr(pool, f"{phase}_request_cleanup")(plan, "cancel-1")
         client.call_utility_async.assert_not_awaited()
@@ -207,9 +208,9 @@ def test_request_cleanup_never_reselects_original_route(phase, route_change):
 
 @pytest.mark.cpu
 @pytest.mark.parametrize("supported", [False, True])
-def test_request_cleanup_reclaim_capability_and_idempotent_phases(supported):
+def test_request_cleanup_reclaim_capability_and_idempotent_phases(supported, mocker: MockerFixture):
     async def run() -> None:
-        pool, client, processor, output = _make_cleanup_pool()
+        pool, client, processor, output = _make_cleanup_pool(mocker)
         client.call_utility_async.return_value = supported
         plan = pool.prepare_request_cleanup("req-1")
         await pool.drain_request_cleanup(plan, "cancel-1")
@@ -224,10 +225,10 @@ def test_request_cleanup_reclaim_capability_and_idempotent_phases(supported):
         processor.commit_aborted_request_state.assert_not_called()
         pool.commit_request_cleanup(plan)
 
-        expected = [call("abort_request_and_drain", "req-1", "cancel-1", ["engine-1"])]
+        expected = [mocker.call("abort_request_and_drain", "req-1", "cancel-1", ["engine-1"])]
         if supported:
-            expected.append(call("reclaim_request_transfer", "req-1", "cancel-1"))
-            expected.append(call("release_request_transfer", "req-1", "cancel-1"))
+            expected.append(mocker.call("reclaim_request_transfer", "req-1", "cancel-1"))
+            expected.append(mocker.call("release_request_transfer", "req-1", "cancel-1"))
         assert client.call_utility_async.await_args_list == expected
         assert plan.drained and plan.reclaimed and plan.released
         processor.abort_requests_collecting_outputs.assert_called_once()
@@ -239,9 +240,9 @@ def test_request_cleanup_reclaim_capability_and_idempotent_phases(supported):
 
 
 @pytest.mark.cpu
-def test_request_cleanup_rejects_unacknowledged_phases_and_invalid_capability():
+def test_request_cleanup_rejects_unacknowledged_phases_and_invalid_capability(mocker: MockerFixture):
     async def run() -> None:
-        pool, client, processor, _output = _make_cleanup_pool()
+        pool, client, processor, _output = _make_cleanup_pool(mocker)
         plan = pool.prepare_request_cleanup("req-1")
         with pytest.raises(RuntimeError, match="before drain acknowledgement"):
             await pool.reclaim_request_cleanup(plan, "cancel-1")
