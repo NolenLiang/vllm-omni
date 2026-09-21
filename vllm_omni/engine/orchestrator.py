@@ -22,6 +22,7 @@ from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from typing import Any
+from uuid import uuid4
 
 import janus
 import torch
@@ -58,7 +59,7 @@ from vllm_omni.engine.messages import (
 )
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
 from vllm_omni.engine.serialization import serialize_additional_information
-from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
+from vllm_omni.engine.stage_pool import StagePool, StageRequestCleanup, StageUnavailableError
 from vllm_omni.errors import DEFAULT_CLIENT_ERROR_TYPE, OmniClientError
 from vllm_omni.metrics import definitions as metric_defs
 from vllm_omni.metrics.prometheus import OmniRequestCounter
@@ -183,6 +184,16 @@ def build_engine_core_request_from_tokens(
 
 
 @dataclass
+class RequestTransferCleanup:
+    """Retained cancellation work, owned by the existing logical request."""
+
+    stages: list[tuple[StagePool, StageRequestCleanup]]
+    outputs: list[OutputMessage]
+    cancel_id: str = field(default_factory=lambda: uuid4().hex)
+    task: asyncio.Task[None] | None = None
+
+
+@dataclass
 class OrchestratorRequestState:
     """Per-request bookkeeping inside the Orchestrator."""
 
@@ -213,6 +224,7 @@ class OrchestratorRequestState:
     running_counter_registered: bool = False
     request_artifact_dirs: set[str] = field(default_factory=set)
     native_kv_transfer_id: str | None = None
+    transfer_cleanup: RequestTransferCleanup | None = None
 
 
 @dataclass
@@ -615,6 +627,113 @@ class OrchestratorBase:
             for output_msg in abort_outputs:
                 await self.output_async_queue.put(output_msg)
 
+    def _can_drain_request_transfers(self, state: OrchestratorRequestState) -> bool:
+        # Limit reclamation to fully admitted, non-resumable session requests.
+        # Partial admission, distributed routing and DP require a wider protocol.
+        if not self.async_chunk or not state.session_owned or state.streaming.enabled or not self.stage_pools:
+            return False
+        for pool in self.stage_pools:
+            config = pool.stage_vllm_config
+            model_config = getattr(config, "model_config", None)
+            connector = getattr(model_config, "stage_connector_config", None)
+            connector_name = (
+                (connector or {}).get("name", "SharedMemoryConnector")
+                if connector is None or isinstance(connector, dict)
+                else connector.name
+            )
+            if (
+                pool.stage_type == "diffusion"
+                or pool.is_distributed
+                or pool.live_num_replicas != 1
+                or pool.stage_id not in state.stage_submit_ts
+                or getattr(getattr(config, "parallel_config", None), "data_parallel_size", None) != 1
+                or not getattr(model_config, "async_chunk", False)
+                or connector_name != "SharedMemoryConnector"
+            ):
+                return False
+        return True
+
+    def _abort_output_messages(self, pool: StagePool, stage_outputs: list[tuple[str, Any]]) -> list[OutputMessage]:
+        messages: list[OutputMessage] = []
+        if not bool(getattr(pool, "final_output", False)) or getattr(pool, "stage_type", None) == "diffusion":
+            return messages
+        final_output_type = getattr(pool.stage_client, "final_output_type", None) or "text"
+        for request_id, output in stage_outputs:
+            state = self.request_states.get(request_id)
+            if state is None or pool.stage_id not in (state.final_output_stage_ids or {state.final_stage_id}):
+                continue
+            replica_id = pool.get_bound_replica_id(request_id)
+            messages.append(
+                OutputMessage(
+                    request_id=request_id,
+                    stage_id=pool.stage_id,
+                    replica_id=replica_id,
+                    engine_outputs=OmniRequestOutput.from_stage_output(
+                        output,
+                        request_id=request_id,
+                        finished=True,
+                        stage_id=pool.stage_id,
+                        replica_id=replica_id,
+                        final_output_type=final_output_type,
+                    ),
+                    metrics=None,
+                    finished=False,
+                    stage_submit_ts=state.stage_submit_ts.get(pool.stage_id),
+                )
+            )
+        return messages
+
+    async def _finish_transfer_cleanup(self, cleanup: RequestTransferCleanup) -> None:
+        # Wait for every call in a phase, including failures, before retrying.
+        # No producer may unlink until every consumer has stopped its old I/O.
+        for phase in ("drain", "reclaim", "release"):
+            calls = []
+            for pool, plan in cleanup.stages:
+                if phase == "drain":
+                    calls.append(pool.drain_request_cleanup(plan, cleanup.cancel_id))
+                elif phase == "reclaim":
+                    calls.append(pool.reclaim_request_cleanup(plan, cleanup.cancel_id))
+                else:
+                    calls.append(pool.release_request_cleanup(plan, cleanup.cancel_id))
+            results = await asyncio.gather(*calls, return_exceptions=True)
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
+            if phase == "drain" and not all(plan.supported for _, plan in cleanup.stages):
+                raise RuntimeError("Stage transfer-cleanup capability differs from the configured SHM deployment")
+        for pool, plan in cleanup.stages:
+            pool.commit_request_cleanup(plan)
+        for pool, plan in cleanup.stages:
+            pool.release_bindings([plan.request_id])
+
+    async def _join_transfer_cleanup(self, state: OrchestratorRequestState) -> RequestTransferCleanup:
+        cleanup = state.transfer_cleanup
+        if cleanup is None:
+            stages = [(pool, pool.prepare_request_cleanup(state.request_id)) for pool in self.stage_pools]
+            outputs = [
+                output for pool, plan in stages for output in self._abort_output_messages(pool, plan.abort_outputs)
+            ]
+            cleanup = state.transfer_cleanup = RequestTransferCleanup(stages, outputs)
+        if (
+            cleanup.task is None
+            or cleanup.task.cancelled()
+            or (cleanup.task.done() and cleanup.task.exception() is not None)
+        ):
+            cleanup.task = asyncio.create_task(self._finish_transfer_cleanup(cleanup))
+        # Caller cancellation must not abandon a partly completed transaction.
+        await asyncio.shield(cleanup.task)
+        return cleanup
+
+    async def _abort_ordinary_request_ids(self, request_ids: list[str]) -> list[OutputMessage]:
+        """Keep legacy stage ordering and failure semantics outside SHM cleanup."""
+        abort_outputs: list[OutputMessage] = []
+        if request_ids:
+            for pool in self.stage_pools:
+                stage_outputs = await pool.abort_requests(request_ids) or []
+                abort_outputs.extend(self._abort_output_messages(pool, stage_outputs))
+                pool.release_bindings(request_ids)
+        return abort_outputs
+
     async def _abort_request_ids(self, request_ids: list[str]) -> list[OutputMessage]:
         """Forward abort requests to all stage pools.
 
@@ -624,38 +743,31 @@ class OrchestratorBase:
         """
         if not request_ids:
             return []
+        transfer_states = []
+        ordinary_ids = []
+        for request_id in dict.fromkeys(request_ids):
+            state = self.request_states.get(request_id)
+            if state is not None and (state.transfer_cleanup is not None or self._can_drain_request_transfers(state)):
+                transfer_states.append(state)
+            else:
+                ordinary_ids.append(request_id)
+        # A failed request must not prevent another target from being stopped.
+        # Legacy aborts still run in stage order, independently of SHM failures.
+        transfer_tasks = [asyncio.create_task(self._join_transfer_cleanup(state)) for state in transfer_states]
+        ordinary_task = asyncio.create_task(self._abort_ordinary_request_ids(ordinary_ids))
+        results = await asyncio.gather(*transfer_tasks, ordinary_task, return_exceptions=True)
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+        # Take retained SHM outputs only once the whole batch has succeeded.
+        # No await may split this section: overlapping callers share cleanups.
         abort_outputs: list[OutputMessage] = []
-        for pool in self.stage_pools:
-            stage_outputs = await pool.abort_requests(request_ids) or []
-            if bool(getattr(pool, "final_output", False)) and getattr(pool, "stage_type", None) != "diffusion":
-                final_output_type = getattr(pool.stage_client, "final_output_type", None) or "text"
-                for orch_req_id, request_output in stage_outputs:
-                    req_state = self.request_states.get(orch_req_id)
-                    if req_state is None:
-                        continue
-                    final_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
-                    if pool.stage_id not in final_stage_ids:
-                        continue
-                    engine_output = OmniRequestOutput.from_stage_output(
-                        request_output,
-                        request_id=orch_req_id,
-                        finished=True,
-                        stage_id=pool.stage_id,
-                        replica_id=pool.get_bound_replica_id(orch_req_id),
-                        final_output_type=final_output_type,
-                    )
-                    abort_outputs.append(
-                        OutputMessage(
-                            request_id=orch_req_id,
-                            stage_id=pool.stage_id,
-                            replica_id=pool.get_bound_replica_id(orch_req_id),
-                            engine_outputs=engine_output,
-                            metrics=None,
-                            finished=False,
-                            stage_submit_ts=req_state.stage_submit_ts.get(pool.stage_id),
-                        )
-                    )
-            pool.release_bindings(request_ids)
+        for task in transfer_tasks:
+            cleanup = task.result()
+            outputs, cleanup.outputs = cleanup.outputs, []
+            abort_outputs.extend(outputs)
+        abort_outputs.extend(ordinary_task.result())
         last_index_by_req: dict[str, int] = {}
         for index, output_msg in enumerate(abort_outputs):
             last_index_by_req[output_msg.request_id] = index
@@ -1481,6 +1593,11 @@ class OrchestratorBase:
         abort_outputs: list[OutputMessage] = []
         if abort:
             abort_outputs = await self._abort_request_ids(cleanup_ids)
+        else:
+            for request_id in cleanup_ids:
+                state = self.request_states.get(request_id)
+                if state is not None and state.transfer_cleanup is not None:
+                    await self._join_transfer_cleanup(state)
         self._release_request_bindings(cleanup_ids)
         for request_id in cleanup_ids:
             self._pd_kv_params.pop(request_id, None)

@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unit tests for SharedMemoryConnector focusing on TP / CFG / metadata fallback."""
 
 import os
+from multiprocessing import shared_memory
+from uuid import uuid4
 
 import pytest
 import torch
@@ -19,6 +21,15 @@ def connector():
     c = SharedMemoryConnector({})
     yield c
     c.close()
+
+
+@pytest.fixture()
+def connector_pair():
+    producer = SharedMemoryConnector({"stage_id": 0})
+    consumer = SharedMemoryConnector({"stage_id": 1})
+    yield producer, consumer, f"exact_cleanup_{uuid4().hex}"
+    producer.close()
+    consumer.close()
 
 
 # ── Key-based read (the fundamental SHM path) ────────────────────────
@@ -196,6 +207,72 @@ class TestHeteroTPMultiKey:
 
 
 class TestCleanup:
+    @pytest.mark.parametrize("consumed", [False, True])
+    def test_cleanup_key_only_removes_owned_exact_key(self, connector_pair, consumed):
+        producer, consumer, prefix = connector_pair
+        key, neighbor = f"{prefix}_0_0", f"{prefix}_0_0_neighbor"
+        assert producer.put("0", "1", key, {"target": True})[0]
+        assert producer.put("0", "1", neighbor, {"neighbor": True})[0]
+        assert producer.supports_exact_key_cleanup
+
+        # A different connector does not own the producer's pending key.
+        consumer.cleanup_key(key)
+        assert os.path.exists(f"/dev/shm/{key}")
+        assert os.path.exists(f"/dev/shm/shm_{key}_lockfile.lock")
+        if consumed:
+            assert consumer.get("0", "1", key)[0] == {"target": True}
+        assert key in producer._pending_keys
+        owned = producer.owned_keys()
+        assert owned == frozenset({key, neighbor})
+
+        producer.cleanup_key(key)
+        producer.cleanup_key(key)
+
+        assert key not in producer._pending_keys
+        assert producer.owned_keys() == frozenset({neighbor})
+        assert owned == frozenset({key, neighbor})
+        assert not os.path.exists(f"/dev/shm/{key}")
+        assert not os.path.exists(f"/dev/shm/shm_{key}_lockfile.lock")
+        assert consumer.get("0", "1", neighbor)[0] == {"neighbor": True}
+
+    @pytest.mark.parametrize("failure", ["segment", "lock"])
+    def test_cleanup_key_failure_retains_ownership_for_retry(self, connector_pair, monkeypatch, failure):
+        producer, consumer, prefix = connector_pair
+        key = f"{prefix}_0_0"
+        lock_file = f"/dev/shm/shm_{key}_lockfile.lock"
+        assert producer.put("0", "1", key, {"retry": True})[0]
+        segment_unlink = shared_memory.SharedMemory.unlink
+        file_unlink = os.unlink
+
+        def fail_segment_unlink(segment):
+            if segment.name == key:
+                raise PermissionError("injected segment unlink failure")
+            return segment_unlink(segment)
+
+        def fail_lock_unlink(path, *args, **kwargs):
+            if os.fspath(path) == lock_file:
+                raise PermissionError("injected lock unlink failure")
+            return file_unlink(path, *args, **kwargs)
+
+        with monkeypatch.context() as fault:
+            if failure == "segment":
+                fault.setattr(shared_memory.SharedMemory, "unlink", fail_segment_unlink)
+            else:
+                fault.setattr(os, "unlink", fail_lock_unlink)
+            with pytest.raises(PermissionError, match="injected"):
+                producer.cleanup_key(key)
+            assert key in producer._pending_keys
+            assert os.path.exists(lock_file)
+            assert os.path.exists(f"/dev/shm/{key}") is (failure == "segment")
+
+        producer.cleanup_key(key)
+        producer.cleanup_key(key)
+
+        assert key not in producer._pending_keys
+        assert not os.path.exists(f"/dev/shm/{key}")
+        assert not os.path.exists(lock_file)
+        assert consumer.get("0", "1", key) is None
+
     def test_cleanup_removes_unconsumed_segment(self, connector):
         data = {"leak": True}
         connector.put("s0", "s1", "cleanup_req_42", data)

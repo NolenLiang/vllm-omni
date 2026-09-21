@@ -12,15 +12,19 @@ import time
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock, Mock
 
 import janus
 import pytest
+from pytest_mock import MockerFixture
+from vllm.config import ParallelConfig, VllmConfig
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.config.model import OmniModelConfig
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.errors import NativeKVHandoffError
 from vllm_omni.engine.messages import (
@@ -103,6 +107,8 @@ class FakePromptRequest:
 
 
 class FakeStageClient:
+    call_utility_async: AsyncMock
+
     def __init__(
         self,
         *,
@@ -228,6 +234,8 @@ class FakeCollectiveRpcStageClient(FakeStageClient):
 
 
 class FakeOutputProcessor:
+    commit_aborted_request_state: Mock
+
     def __init__(self, *, request_outputs: list[object] | None = None) -> None:
         self.request_outputs = list(request_outputs or [])
         self.add_request_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
@@ -1979,6 +1987,7 @@ async def test_abort_retry_does_not_repeat_successful_stage_abort():
     second = _Pool(fail_once=True)
     orchestrator = object.__new__(Orchestrator)
     orchestrator.stage_pools = [first, second]
+    orchestrator.request_states = {}
 
     with pytest.raises(RuntimeError, match="stage abort failed"):
         await orchestrator._abort_request_ids(["req-a"])
@@ -1992,6 +2001,259 @@ async def test_abort_retry_does_not_repeat_successful_stage_abort():
     assert first.physical_abort_calls == 1
     assert second.physical_abort_calls == 2
     assert second.bound == set()
+
+
+def _transfer_cleanup_orchestrator(mocker: MockerFixture, request_ids=("req-transfer",)):
+    clients = [FakeStageClient(final_output=stage_id == 2) for stage_id in range(3)]
+    processors = [FakeOutputProcessor() for _ in clients]
+    for client, processor in zip(clients, processors):
+        client.call_utility_async = mocker.AsyncMock(return_value=True)
+        processor.commit_aborted_request_state = mocker.Mock()
+    configs: list[object] = [
+        mocker.Mock(
+            spec=VllmConfig,
+            model_config=mocker.Mock(
+                spec=OmniModelConfig,
+                max_model_len=64,
+                async_chunk=True,
+                stage_connector_config={"name": "SharedMemoryConnector"},
+            ),
+            parallel_config=mocker.Mock(spec=ParallelConfig, data_parallel_size=1),
+        )
+        for _ in clients
+    ]
+    pools = _build_stage_pools(
+        [[client] for client in clients], output_processors=processors, stage_vllm_configs=configs
+    )
+    for pool in pools:
+        for request_id in request_ids:
+            pool._request_bindings[request_id] = 0
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=pools,
+        async_chunk=True,
+    )
+    for request_id in request_ids:
+        orchestrator.request_states[request_id] = OrchestratorRequestState(
+            request_id=request_id,
+            session_owned=True,
+            final_stage_id=2,
+            final_output_stage_ids={2},
+            stage_submit_ts={stage_id: 1.0 for stage_id in range(3)},
+        )
+    return orchestrator, clients, processors
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failed_request_id", ["req-first", "req-second"])
+async def test_transfer_cleanup_batch_failure_aborts_all_and_preserves_outputs(
+    failed_request_id, mocker: MockerFixture
+) -> None:
+    transfer_ids = ["req-first", "req-second"]
+    request_ids = [*transfer_ids, "req-ordinary"]
+    orchestrator, clients, _processors = _transfer_cleanup_orchestrator(mocker, request_ids)
+    orchestrator.request_states["req-ordinary"].session_owned = False
+    fail_once = True
+
+    async def failing_utility(method, request_id, *_args):
+        nonlocal fail_once
+        if method == "reclaim_request_transfer" and request_id == failed_request_id and fail_once:
+            fail_once = False
+            raise RuntimeError("batch transfer cleanup failed")
+        return True
+
+    clients[1].call_utility_async.side_effect = failing_utility
+    with pytest.raises(RuntimeError, match="batch transfer cleanup failed"):
+        await orchestrator._abort_request_ids(request_ids)
+
+    for client in clients:
+        drained_ids = {
+            call.args[1]
+            for call in client.call_utility_async.await_args_list
+            if call.args[0] == "abort_request_and_drain"
+        }
+        assert drained_ids == set(transfer_ids)
+        assert client.abort_calls == [["req-ordinary"]]
+    for request_id in transfer_ids:
+        cleanup = orchestrator.request_states[request_id].transfer_cleanup
+        assert cleanup is not None
+        assert [output.request_id for output in cleanup.outputs] == [request_id]
+
+    # Overlapping retries must not consume a successful sibling's prefix twice.
+    results = await asyncio.gather(
+        orchestrator._abort_request_ids(transfer_ids),
+        orchestrator._abort_request_ids(transfer_ids),
+    )
+    outputs = [output for result in results for output in result]
+    assert sorted(output.request_id for output in outputs) == transfer_ids
+    assert all(output.finished for output in outputs)
+    assert await orchestrator._abort_request_ids(transfer_ids) == []
+    for client in clients:
+        assert sum(call.args[0] == "abort_request_and_drain" for call in client.call_utility_async.await_args_list) == 2
+
+
+@pytest.mark.asyncio
+async def test_transfer_cleanup_has_global_drain_and_reclaim_barriers(mocker: MockerFixture) -> None:
+    orchestrator, clients, processors = _transfer_cleanup_orchestrator(mocker)
+    drain_entered, allow_drain = asyncio.Event(), asyncio.Event()
+    reclaim_entered, allow_reclaim = asyncio.Event(), asyncio.Event()
+
+    async def last_stage_utility(method, *_args):
+        if method == "abort_request_and_drain":
+            drain_entered.set()
+            await allow_drain.wait()
+        elif method == "reclaim_request_transfer":
+            reclaim_entered.set()
+            await allow_reclaim.wait()
+        return True
+
+    clients[2].call_utility_async.side_effect = last_stage_utility
+    cleanup_task = asyncio.create_task(orchestrator._cleanup_request_ids(["req-transfer"], abort=True))
+    try:
+        await asyncio.wait_for(drain_entered.wait(), timeout=2)
+        for client in clients:
+            assert [args.args[0] for args in client.call_utility_async.await_args_list] == ["abort_request_and_drain"]
+        for pool, processor in zip(orchestrator.stage_pools, processors):
+            assert pool.get_bound_replica_id("req-transfer") == 0
+            processor.commit_aborted_request_state.assert_not_called()
+
+        allow_drain.set()
+        await asyncio.wait_for(reclaim_entered.wait(), timeout=2)
+        for client in clients:
+            assert [args.args[0] for args in client.call_utility_async.await_args_list] == [
+                "abort_request_and_drain",
+                "reclaim_request_transfer",
+            ]
+        for processor in processors:
+            processor.commit_aborted_request_state.assert_not_called()
+
+        allow_reclaim.set()
+        outputs = await asyncio.wait_for(asyncio.shield(cleanup_task), timeout=2)
+        assert len(outputs) == 1 and outputs[0].finished
+        assert "req-transfer" not in orchestrator.request_states
+        for pool, client, processor in zip(orchestrator.stage_pools, clients, processors):
+            assert pool.get_bound_replica_id("req-transfer") is None
+            assert client.call_utility_async.await_args_list[-1].args[0] == "release_request_transfer"
+            processor.commit_aborted_request_state.assert_called_once_with(["req-transfer"], internal=False)
+    finally:
+        allow_drain.set()
+        allow_reclaim.set()
+        await asyncio.wait_for(asyncio.gather(cleanup_task, return_exceptions=True), timeout=2)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failed_method", ["abort_request_and_drain", "reclaim_request_transfer", "release_request_transfer"]
+)
+async def test_transfer_cleanup_failure_retains_plans_bindings_and_op_for_retry(
+    failed_method, mocker: MockerFixture
+) -> None:
+    orchestrator, clients, processors = _transfer_cleanup_orchestrator(mocker)
+    state = orchestrator.request_states["req-transfer"]
+    fail_once = True
+
+    async def failing_utility(method, *_args):
+        nonlocal fail_once
+        if method == failed_method and fail_once:
+            fail_once = False
+            raise RuntimeError("transfer phase failed")
+        return True
+
+    clients[1].call_utility_async.side_effect = failing_utility
+    with pytest.raises(RuntimeError, match="transfer phase failed"):
+        await orchestrator._cleanup_request_ids(["req-transfer"], abort=True)
+
+    retained = state.transfer_cleanup
+    assert retained is not None
+    assert orchestrator.request_states["req-transfer"] is state
+    methods = ["abort_request_and_drain", "reclaim_request_transfer", "release_request_transfer"]
+    failed_phase = methods.index(failed_method)
+    for stage_id, (_pool, plan) in enumerate(retained.stages):
+        completed_phases = failed_phase + int(stage_id != 1)
+        assert (plan.supported is not None, plan.reclaimed, plan.released) == tuple(
+            index < completed_phases for index in range(3)
+        )
+        assert plan.supported is (None if completed_phases == 0 else True)
+    for pool, processor in zip(orchestrator.stage_pools, processors):
+        assert pool.get_bound_replica_id("req-transfer") == 0
+        processor.commit_aborted_request_state.assert_not_called()
+        assert processor.abort_calls == [["req-transfer"]]
+
+    outputs = await orchestrator._cleanup_request_ids(["req-transfer"], abort=True)
+
+    assert state.transfer_cleanup is retained
+    assert len(outputs) == 1 and outputs[0].finished
+    assert "req-transfer" not in orchestrator.request_states
+    for stage_id, (pool, client, processor) in enumerate(zip(orchestrator.stage_pools, clients, processors)):
+        calls = client.call_utility_async.await_args_list
+        expected = list(methods)
+        if stage_id == 1:
+            expected.insert(failed_phase, failed_method)
+        assert [args.args[0] for args in calls] == expected
+        assert {args.args[2] for args in calls} == {retained.cancel_id}
+        assert processor.abort_calls == [["req-transfer"]]
+        processor.commit_aborted_request_state.assert_called_once()
+        assert pool.get_bound_replica_id("req-transfer") is None
+
+
+@pytest.mark.asyncio
+async def test_transfer_cleanup_coalesces_callers_and_survives_caller_cancellation(mocker: MockerFixture) -> None:
+    orchestrator, clients, processors = _transfer_cleanup_orchestrator(mocker)
+    entered, allow_drain = asyncio.Event(), asyncio.Event()
+
+    async def slow_drain(method, *_args):
+        if method == "abort_request_and_drain":
+            entered.set()
+            await allow_drain.wait()
+        return True
+
+    clients[2].call_utility_async.side_effect = slow_drain
+    first = asyncio.create_task(orchestrator._abort_request_ids(["req-transfer"]))
+    second = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        retained = orchestrator.request_states["req-transfer"].transfer_cleanup
+        assert retained is not None and retained.task is not None
+        worker = retained.task
+        second = asyncio.create_task(orchestrator._abort_request_ids(["req-transfer"]))
+        await asyncio.sleep(0)
+        assert retained.task is worker
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert not worker.cancelled()
+        allow_drain.set()
+        outputs = await asyncio.wait_for(asyncio.shield(second), timeout=2)
+        assert len(outputs) == 1 and outputs[0].finished
+        assert await orchestrator._abort_request_ids(["req-transfer"]) == []
+        for client, processor in zip(clients, processors):
+            assert client.call_utility_async.await_count == 3
+            assert processor.abort_calls == [["req-transfer"]]
+            processor.commit_aborted_request_state.assert_called_once()
+    finally:
+        allow_drain.set()
+        tasks = [first] if second is None else [first, second]
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_transfer_cleanup_unsupported_stage_fails_closed_before_reclaim(mocker: MockerFixture) -> None:
+    orchestrator, clients, processors = _transfer_cleanup_orchestrator(mocker)
+    state = orchestrator.request_states["req-transfer"]
+    clients[1].call_utility_async.return_value = False
+
+    with pytest.raises(RuntimeError, match="capability differs"):
+        await orchestrator._cleanup_request_ids(["req-transfer"], abort=True)
+
+    for pool, client, processor in zip(orchestrator.stage_pools, clients, processors):
+        methods = [args.args[0] for args in client.call_utility_async.await_args_list]
+        assert methods == ["abort_request_and_drain"]
+        assert pool.get_bound_replica_id("req-transfer") == 0
+        processor.commit_aborted_request_state.assert_not_called()
+    assert orchestrator.request_states["req-transfer"] is state
+    assert state.transfer_cleanup is not None
 
 
 @pytest.mark.asyncio

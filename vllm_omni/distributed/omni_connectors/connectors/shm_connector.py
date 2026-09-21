@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import fcntl
 import os
@@ -23,6 +23,8 @@ class SharedMemoryConnector(OmniConnectorBase):
     (that is the RDMA connector's job).  When such metadata is passed in,
     the connector silently falls back to key-based lookup.
     """
+
+    supports_exact_key_cleanup: bool = True
 
     def __init__(self, config: dict[str, Any]):
         self.config = config
@@ -141,6 +143,32 @@ class SharedMemoryConnector(OmniConnectorBase):
         if result is not None:
             self._metrics["gets"] += 1
         return result
+
+    def owned_keys(self) -> frozenset[str]:
+        """Snapshot of tracked producer keys, including already-consumed chunks."""
+        return frozenset(self._pending_keys)
+
+    def cleanup_key(self, key: str) -> None:
+        """Reclaim one owned key after all users have been fenced and drained.
+
+        Segment and lock must both be absent before ownership is released.
+        Other failures propagate with the key still tracked for retry.
+        """
+        if key not in self._pending_keys:
+            return
+        try:
+            segment = shm_pkg.SharedMemory(name=key)
+            try:
+                segment.unlink()
+            finally:
+                segment.close()
+        except FileNotFoundError:
+            pass
+        try:
+            os.unlink(f"/dev/shm/shm_{key}_lockfile.lock")
+        except FileNotFoundError:
+            pass
+        self._pending_keys.discard(key)
 
     def cleanup(self, request_id: str) -> None:
         """Best-effort cleanup of unconsumed SHM segments for *request_id*.
