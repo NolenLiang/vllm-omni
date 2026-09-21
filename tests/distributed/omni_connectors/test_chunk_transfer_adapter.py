@@ -576,14 +576,15 @@ def test_load_poll_uses_request_scoped_payload_sender_endpoint(build_adapter):
     adapter, connector = build_adapter(stage_id=2, model_mode="ar")
     request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
     request.payload_sender_info = {"host": "10.0.0.1", "zmq_port": 50051}
-    connector.get.return_value = None
-
-    adapter._poll_single_request(_dequeue_load_entry(adapter, request))
+    # Exercise the receive loop, including its internal-to-external ID mapping.
+    connector.get.side_effect = lambda *_args: adapter.stop_event.set()
+    adapter.load_async(request)
+    adapter.recv_loop()
 
     connector.get.assert_called_once_with(
         "1",
         "2",
-        "req-1_1_0",
+        "external-1_1_0",
         {"source_host": "10.0.0.1", "source_port": 50051},
     )
 
@@ -2094,6 +2095,149 @@ def test_finish_requests_does_not_wait_for_inflight_send(build_adapter):
     assert not sender.is_alive()
     assert first.external_req_id not in adapter._sender_tokens
     assert first.external_req_id not in adapter.put_req_chunk
+
+
+def _exact_cleanup_connector(connector):
+    connector.supports_exact_key_cleanup = True
+    connector._pending_keys = set()
+    connector.cleanup_key.side_effect = connector._pending_keys.discard
+
+
+def test_transfer_retirement_drains_put_then_reclaims_and_reuses_id(build_adapter):
+    adapter, connector = build_adapter(stage_id=1)
+    _exact_cleanup_connector(connector)
+    request = _req("old", RequestStatus.WAITING, external_req_id="same-id")
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct()
+    entered, resume, replacement_sent = (threading.Event() for _ in range(3))
+
+    def put(**kwargs):
+        replacement = entered.is_set()
+        if not replacement:
+            entered.set()
+            assert resume.wait(2)
+        connector._pending_keys.add(kwargs["put_key"])
+        if replacement:
+            replacement_sent.set()
+        return True, 1, {}
+
+    connector.put.side_effect = put
+    adapter.save_async(None, request)
+    sender = threading.Thread(target=adapter.save_loop, daemon=True)
+    sender.start()
+    try:
+        assert entered.wait(1)
+        drained = adapter.retire_transfer("same-id", "cancel-1")
+        assert adapter.retire_transfer("same-id", "cancel-1") is drained
+        adapter.finish_requests(["old"], RequestStatus.FINISHED_ABORTED, {"old": request})
+        assert not drained.done()
+        with pytest.raises(RuntimeError):
+            adapter.reclaim_transfer("same-id", "cancel-1")
+        resume.set()
+        drained.result(timeout=2)
+        assert adapter.is_transfer_retiring("same-id")
+        adapter.reclaim_transfer("same-id", "cancel-1")
+        assert connector._pending_keys == set()
+        adapter.release_transfer("same-id", "cancel-1")
+        assert not adapter.is_transfer_retiring("same-id")
+
+        replacement = _req("new", RequestStatus.WAITING, external_req_id="same-id")
+        adapter.save_async(None, replacement)
+        assert replacement_sent.wait(1)
+        adapter.release_transfer("same-id", "cancel-1")
+        assert connector.put.call_args.kwargs["put_key"] == "same-id_1_0"
+        assert connector._pending_keys == {"same-id_1_0"}
+    finally:
+        resume.set()
+        adapter.stop_event.set()
+        sender.join(timeout=2)
+    assert not sender.is_alive()
+
+
+def test_transfer_retirement_waits_for_unregistered_receiver(build_adapter):
+    adapter, connector = build_adapter(stage_id=1)
+    _exact_cleanup_connector(connector)
+    request = _req("old", RequestStatus.WAITING, external_req_id="same-id")
+    entered, resume = threading.Event(), threading.Event()
+
+    def get(*args):
+        entered.set()
+        assert resume.wait(2)
+        return None
+
+    connector.get.side_effect = get
+    adapter.load_async(request)
+    receiver = threading.Thread(target=adapter.recv_loop, daemon=True)
+    receiver.start()
+    try:
+        assert entered.wait(1)
+        adapter.cleanup_receiver("old")
+        drained = adapter.retire_transfer("same-id", "cancel-1")
+        assert not drained.done()
+        resume.set()
+        drained.result(timeout=2)
+        adapter.reclaim_transfer("same-id", "cancel-1")
+        adapter.release_transfer("same-id", "cancel-1")
+        assert connector.get.call_count == 1
+    finally:
+        resume.set()
+        adapter.stop_event.set()
+        receiver.join(timeout=2)
+    assert not receiver.is_alive()
+
+
+def test_transfer_reclaim_failure_keeps_generation_for_exact_retry(build_adapter):
+    adapter, connector = build_adapter(stage_id=1)
+    _exact_cleanup_connector(connector)
+    connector._pending_keys.update({"retired_1_0", "retired_1_1", "retired_1_0_1", "retired_suffix_1_0"})
+    # A naturally completed sender may have no scheduler request or token.
+    drained = adapter.retire_transfer("retired", "cancel-1")
+    drained.result(timeout=1)
+    with pytest.raises(RuntimeError):
+        adapter.retire_transfer("retired", "different-cancel")
+    with pytest.raises(RuntimeError):
+        adapter.reclaim_transfer("retired", "different-cancel")
+
+    def cleanup(key):
+        if key == "retired_1_1":
+            raise OSError("retry this exact key")
+        connector._pending_keys.discard(key)
+
+    connector.cleanup_key.side_effect = cleanup
+    with pytest.raises(OSError, match="retry this exact key"):
+        adapter.reclaim_transfer("retired", "cancel-1")
+    with pytest.raises(RuntimeError):
+        adapter.release_transfer("retired", "cancel-1")
+    assert adapter.is_transfer_retiring("retired")
+    assert "retired_1_1" in connector._pending_keys
+    connector.cleanup_key.side_effect = connector._pending_keys.discard
+    adapter.reclaim_transfer("retired", "cancel-1")
+    adapter.release_transfer("retired", "cancel-1")
+    assert not adapter.is_transfer_retiring("retired")
+    assert connector._pending_keys == {"retired_1_0_1", "retired_suffix_1_0"}
+
+
+def test_transfer_retirement_drops_queued_terminal_but_local_finish_keeps_it(build_adapter):
+    adapter, connector = build_adapter(stage_id=1)
+    _exact_cleanup_connector(connector)
+    full = _req("full", RequestStatus.FINISHED_STOPPED)
+    local = _req("local", RequestStatus.FINISHED_STOPPED)
+    adapter.save_async(None, full)
+    adapter.save_async(None, local)
+    adapter.cleanup_sender("local")
+    drained = adapter.retire_transfer("full", "cancel-1")
+    adapter.cleanup_sender("full")
+    assert not drained.done()
+    sender = threading.Thread(target=adapter.save_loop, daemon=True)
+    sender.start()
+    try:
+        drained.result(timeout=2)
+        adapter.reclaim_transfer("full", "cancel-1")
+        adapter.release_transfer("full", "cancel-1")
+    finally:
+        adapter.stop_event.set()
+        sender.join(timeout=2)
+    assert not sender.is_alive()
+    assert [entry.kwargs["put_key"] for entry in connector.put.call_args_list] == ["local_1_0"]
 
 
 def test_cleanup_only_affects_target_request(build_adapter):

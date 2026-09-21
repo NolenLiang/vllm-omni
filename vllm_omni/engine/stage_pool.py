@@ -71,6 +71,25 @@ class _ReplicaMetrics:
     agg_total_gen_time_ms: float = 0.0
 
 
+@dataclass
+class StageRequestCleanup:
+    """Retained route and progress for one all-stage request cancellation.
+
+    The orchestrator owns this plan and serializes retries with the same
+    cancellation ID. No phase reconstructs its identity from mutable OP state.
+    """
+
+    request_id: str
+    replica_id: int
+    client: StagePoolLLMClient
+    engine_request_ids: list[str]
+    abort_outputs: list[tuple[str, Any]]
+    supported: bool | None = None
+    drained: bool = False
+    reclaimed: bool = False
+    released: bool = False
+
+
 class StagePool:
     """Replicas of one logical stage + per-stage routing (LB + affinity).
 
@@ -1232,6 +1251,76 @@ class StagePool:
         return cast(StagePoolDiffusionClient, raw_client).get_diffusion_output_nowait()
 
     # ---- Stage-local control plane ----
+
+    def prepare_request_cleanup(self, request_id: str) -> StageRequestCleanup:
+        """Snapshot the exact live route and abort prefix without committing OP state."""
+        if self.stage_type == "diffusion":
+            raise ValueError("Retained request cleanup requires an LLM stage")
+        replica_id = self.get_bound_replica_id(request_id)
+        if replica_id is None or not self.is_replica_available(replica_id):
+            raise StageUnavailableError(f"No live cleanup route for req={request_id} in stage-{self.stage_id}")
+        client = self._llm_client(replica_id)
+        collect = getattr(self._output_processor, "abort_requests_collecting_outputs", None)
+        if not callable(collect):
+            raise RuntimeError("Retained request cleanup requires non-committing abort output collection")
+        engine_ids, outputs = collect([request_id], internal=False, commit_state=False)
+        return StageRequestCleanup(
+            request_id=request_id,
+            replica_id=replica_id,
+            client=client,
+            # A naturally finished stage may have no remaining OP mapping.
+            # The EngineCore utility also resolves live requests by external ID.
+            engine_request_ids=list(engine_ids) or [request_id],
+            abort_outputs=[(request_id, output) for output in outputs],
+        )
+
+    def _request_cleanup_client(self, plan: StageRequestCleanup) -> StagePoolLLMClient:
+        if not self.is_replica_available(plan.replica_id) or self.clients[plan.replica_id] is not plan.client:
+            raise StageUnavailableError(
+                f"Original cleanup route unavailable for req={plan.request_id} in stage-{self.stage_id}"
+            )
+        return plan.client
+
+    async def drain_request_cleanup(self, plan: StageRequestCleanup, cancel_id: str) -> None:
+        """Retire and drain this stage; preserve the plan unchanged on failure."""
+        if plan.drained:
+            return
+        client = self._request_cleanup_client(plan)
+        supported = await client.call_utility_async(
+            "abort_request_and_drain", plan.request_id, cancel_id, plan.engine_request_ids
+        )
+        if not isinstance(supported, bool):
+            raise TypeError("abort_request_and_drain must return a boolean transfer-cleanup capability")
+        plan.supported = supported
+        plan.drained = True
+
+    async def reclaim_request_cleanup(self, plan: StageRequestCleanup, cancel_id: str) -> None:
+        """Reclaim after the caller confirms every participating stage drained."""
+        if plan.reclaimed:
+            return
+        if not plan.drained or plan.supported is None:
+            raise RuntimeError("Cannot reclaim request transfer before drain acknowledgement")
+        if plan.supported:
+            client = self._request_cleanup_client(plan)
+            await client.call_utility_async("reclaim_request_transfer", plan.request_id, cancel_id)
+        plan.reclaimed = True
+
+    async def release_request_cleanup(self, plan: StageRequestCleanup, cancel_id: str) -> None:
+        """Release the retired generation only after global reclamation succeeds."""
+        if plan.released:
+            return
+        if not plan.reclaimed:
+            raise RuntimeError("Cannot release request transfer before reclamation acknowledgement")
+        if plan.supported:
+            client = self._request_cleanup_client(plan)
+            await client.call_utility_async("release_request_transfer", plan.request_id, cancel_id)
+        plan.released = True
+
+    def commit_request_cleanup(self, plan: StageRequestCleanup) -> None:
+        """Commit only OP state; the orchestrator owns final route release."""
+        if not plan.released:
+            raise RuntimeError("Cannot commit request cleanup before all transfer phases complete")
+        self._output_processor.commit_aborted_request_state([plan.request_id], internal=False)
 
     async def abort_requests(self, request_ids: list[str]) -> list[tuple[str, Any]]:
         """Abort the given requests in this stage pool.

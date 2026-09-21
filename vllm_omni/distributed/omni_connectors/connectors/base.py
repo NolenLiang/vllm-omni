@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from abc import ABC, abstractmethod
 from typing import Any
@@ -16,6 +16,7 @@ class OmniConnectorBase(ABC):
     # without going through OmniSerializer.  Connectors that copy raw
     # payloads directly (e.g. RDMA) should override this to True.
     supports_raw_data: bool = False
+    supports_exact_key_cleanup: bool = False
 
     @abstractmethod
     def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
@@ -59,6 +60,15 @@ class OmniConnectorBase(ABC):
     def cleanup(self, request_id: str) -> None:
         """Clean up resources for a request."""
         pass
+
+    def cleanup_key(self, key: str) -> None:
+        """Reclaim an owned exact put key, or raise when unsupported.
+
+        Callers must fence and drain all users of the key and prevent its
+        reuse until cleanup succeeds. Implementations retain ownership on
+        failure so the caller can retry; an unowned key is a no-op.
+        """
+        raise NotImplementedError("This connector does not support exact-key cleanup")
 
     @abstractmethod
     def health(self) -> dict[str, Any]:

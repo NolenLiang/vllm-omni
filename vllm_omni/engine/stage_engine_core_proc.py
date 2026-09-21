@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import os
 import signal
+from concurrent.futures import Future
 from typing import Any
 
 import vllm.v1.engine.core as _vllm_engine_core_module
@@ -117,6 +118,57 @@ class StageEngineCoreProc(EngineCoreProc):
         scheduler_request.external_req_id = getattr(request, "external_req_id", request.request_id)
         scheduler_request.payload_sender_info = getattr(request, "payload_sender_info", None)
         return scheduler_request, current_wave
+
+    def add_request(self, request: Any, request_wave: int = 0) -> None:
+        # ADD and the retirement utility are serialized by the core loop.
+        # Checking in preprocess_add_request would race on the input thread.
+        adapter = getattr(self.scheduler, "chunk_transfer_adapter", None)
+        external_id = getattr(request, "external_req_id", request.request_id)
+        if adapter is not None and adapter.is_transfer_retiring(external_id):
+            self._send_abort_outputs_to_client([request.request_id], request.client_index)
+            return
+        super().add_request(request, request_wave)
+
+    def abort_request_and_drain(self, external_id: str, cancel_id: str, internal_ids: list[str]) -> bool | Future[bool]:
+        """Stop this request and acknowledge when its transfer I/O is idle.
+
+        Only whole-pipeline cancellation uses this utility. Ordinary stage-local
+        aborts still deliver their terminal chunk to a live downstream stage.
+        Returning False acknowledges the abort, but forbids transfer reclamation.
+        """
+        adapter = getattr(self.scheduler, "chunk_transfer_adapter", None)
+        if adapter is None or not adapter.connector.supports_exact_key_cleanup:
+            self.abort_requests(internal_ids)
+            return False
+
+        drained = adapter.retire_transfer(external_id, cancel_id)
+        request_ids = set(internal_ids)
+        request_ids.update(
+            request_id
+            for request_id, request in self.scheduler.requests.items()
+            if getattr(request, "external_req_id", request_id) == external_id
+        )
+        self.abort_requests(list(request_ids))
+        result: Future[bool] = Future()
+
+        def complete(future: Future[None]) -> None:
+            try:
+                future.result()
+            except Exception as exc:
+                result.set_exception(exc)
+            else:
+                result.set_result(True)
+
+        drained.add_done_callback(complete)
+        return result
+
+    def reclaim_request_transfer(self, external_id: str, cancel_id: str) -> None:
+        """Remove owned leftovers only after every stage acknowledged drain."""
+        self.scheduler.chunk_transfer_adapter.reclaim_transfer(external_id, cancel_id)
+
+    def release_request_transfer(self, external_id: str, cancel_id: str) -> None:
+        """Release the request-id hold after all stages reclaimed successfully."""
+        self.scheduler.chunk_transfer_adapter.release_transfer(external_id, cancel_id)
 
     @staticmethod
     def run_stage_core(

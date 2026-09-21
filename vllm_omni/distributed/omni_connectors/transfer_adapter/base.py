@@ -68,7 +68,6 @@ class OmniTransferAdapterBase:
                 if request_id in self._cancelled_load_reqs:
                     self._cancelled_load_reqs.discard(request_id)
                     continue
-                self.request_ids_mapping[request_id] = request.external_req_id
                 try:
                     is_success = self._poll_single_request(request)
                     if is_success:
