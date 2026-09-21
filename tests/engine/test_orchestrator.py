@@ -16,6 +16,7 @@ from unittest.mock import AsyncMock, Mock
 
 import janus
 import pytest
+from pytest_mock import MockerFixture
 from vllm.config import ParallelConfig, VllmConfig
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
@@ -2008,22 +2009,22 @@ async def test_abort_retry_does_not_repeat_successful_stage_abort():
     assert second.bound == set()
 
 
-def _transfer_cleanup_orchestrator(request_ids=("req-transfer",)):
+def _transfer_cleanup_orchestrator(mocker: MockerFixture, request_ids=("req-transfer",)):
     clients = [FakeStageClient(final_output=stage_id == 2) for stage_id in range(3)]
     processors = [FakeOutputProcessor() for _ in clients]
     for client, processor in zip(clients, processors):
-        client.call_utility_async = AsyncMock(return_value=True)
-        processor.commit_aborted_request_state = Mock()
+        client.call_utility_async = mocker.AsyncMock(return_value=True)
+        processor.commit_aborted_request_state = mocker.Mock()
     configs: list[object] = [
-        Mock(
+        mocker.Mock(
             spec=VllmConfig,
-            model_config=Mock(
+            model_config=mocker.Mock(
                 spec=OmniModelConfig,
                 max_model_len=64,
                 async_chunk=True,
                 stage_connector_config={"name": "SharedMemoryConnector"},
             ),
-            parallel_config=Mock(spec=ParallelConfig, data_parallel_size=1),
+            parallel_config=mocker.Mock(spec=ParallelConfig, data_parallel_size=1),
         )
         for _ in clients
     ]
@@ -2053,10 +2054,12 @@ def _transfer_cleanup_orchestrator(request_ids=("req-transfer",)):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failed_request_id", ["req-first", "req-second"])
-async def test_transfer_cleanup_batch_failure_aborts_all_and_preserves_outputs(failed_request_id) -> None:
+async def test_transfer_cleanup_batch_failure_aborts_all_and_preserves_outputs(
+    failed_request_id, mocker: MockerFixture
+) -> None:
     transfer_ids = ["req-first", "req-second"]
     request_ids = [*transfer_ids, "req-ordinary"]
-    orchestrator, clients, _processors = _transfer_cleanup_orchestrator(request_ids)
+    orchestrator, clients, _processors = _transfer_cleanup_orchestrator(mocker, request_ids)
     orchestrator.request_states["req-ordinary"].session_owned = False
     fail_once = True
 
@@ -2098,8 +2101,8 @@ async def test_transfer_cleanup_batch_failure_aborts_all_and_preserves_outputs(f
 
 
 @pytest.mark.asyncio
-async def test_transfer_cleanup_has_global_drain_and_reclaim_barriers() -> None:
-    orchestrator, clients, processors = _transfer_cleanup_orchestrator()
+async def test_transfer_cleanup_has_global_drain_and_reclaim_barriers(mocker: MockerFixture) -> None:
+    orchestrator, clients, processors = _transfer_cleanup_orchestrator(mocker)
     drain_entered, allow_drain = asyncio.Event(), asyncio.Event()
     reclaim_entered, allow_reclaim = asyncio.Event(), asyncio.Event()
 
@@ -2150,8 +2153,10 @@ async def test_transfer_cleanup_has_global_drain_and_reclaim_barriers() -> None:
 @pytest.mark.parametrize(
     "failed_method", ["abort_request_and_drain", "reclaim_request_transfer", "release_request_transfer"]
 )
-async def test_transfer_cleanup_failure_retains_plans_bindings_and_op_for_retry(failed_method) -> None:
-    orchestrator, clients, processors = _transfer_cleanup_orchestrator()
+async def test_transfer_cleanup_failure_retains_plans_bindings_and_op_for_retry(
+    failed_method, mocker: MockerFixture
+) -> None:
+    orchestrator, clients, processors = _transfer_cleanup_orchestrator(mocker)
     state = orchestrator.request_states["req-transfer"]
     fail_once = True
 
@@ -2198,8 +2203,8 @@ async def test_transfer_cleanup_failure_retains_plans_bindings_and_op_for_retry(
 
 
 @pytest.mark.asyncio
-async def test_transfer_cleanup_coalesces_callers_and_survives_caller_cancellation() -> None:
-    orchestrator, clients, processors = _transfer_cleanup_orchestrator()
+async def test_transfer_cleanup_coalesces_callers_and_survives_caller_cancellation(mocker: MockerFixture) -> None:
+    orchestrator, clients, processors = _transfer_cleanup_orchestrator(mocker)
     entered, allow_drain = asyncio.Event(), asyncio.Event()
 
     async def slow_drain(method, *_args):
@@ -2238,8 +2243,8 @@ async def test_transfer_cleanup_coalesces_callers_and_survives_caller_cancellati
 
 
 @pytest.mark.asyncio
-async def test_transfer_cleanup_unsupported_stage_fails_closed_before_reclaim() -> None:
-    orchestrator, clients, processors = _transfer_cleanup_orchestrator()
+async def test_transfer_cleanup_unsupported_stage_fails_closed_before_reclaim(mocker: MockerFixture) -> None:
+    orchestrator, clients, processors = _transfer_cleanup_orchestrator(mocker)
     state = orchestrator.request_states["req-transfer"]
     clients[1].call_utility_async.return_value = False
 
