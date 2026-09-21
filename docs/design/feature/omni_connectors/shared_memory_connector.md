@@ -45,6 +45,7 @@ This makes `SharedMemoryConnector` the simplest connector in the OmniConnector f
 - `put(from_stage, to_stage, put_key, data)`
 - `get(from_stage, to_stage, get_key, metadata=None)`
 - `cleanup(request_id)`
+- `owned_keys()` for an immutable snapshot of producer-tracked keys
 - `cleanup_key(key)` for coordinated, exact-key reclamation
 - `health()`
 - `close()`
@@ -192,7 +193,9 @@ three ordered phases:
 2. After all stages confirm that transfer I/O has stopped, reclaim exact chunk
    keys from each producer's own tracking set. `cleanup_key()` ignores an
    already absent object, but propagates other errors and retains ownership
-   until both the segment and lock are absent.
+   until both the segment and lock are absent. The adapter selects keys from
+   `owned_keys()` without accessing mutable connector tracking. Its debug log
+   counts processed keys, including those already consumed, not physical deletions.
 3. After all stages reclaim successfully, release the retired generations,
    commit aborted output state, and release request bindings.
 

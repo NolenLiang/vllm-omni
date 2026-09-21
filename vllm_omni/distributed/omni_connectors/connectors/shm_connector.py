@@ -144,6 +144,10 @@ class SharedMemoryConnector(OmniConnectorBase):
             self._metrics["gets"] += 1
         return result
 
+    def owned_keys(self) -> frozenset[str]:
+        """Snapshot of tracked producer keys, including already-consumed chunks."""
+        return frozenset(self._pending_keys)
+
     def cleanup_key(self, key: str) -> None:
         """Reclaim one owned key after all users have been fenced and drained.
 

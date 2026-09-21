@@ -2178,7 +2178,9 @@ async def test_transfer_cleanup_failure_retains_plans_bindings_and_op_for_retry(
     failed_phase = methods.index(failed_method)
     for stage_id, (_pool, plan) in enumerate(retained.stages):
         completed_phases = failed_phase + int(stage_id != 1)
-        assert (plan.drained, plan.reclaimed, plan.released) == tuple(index < completed_phases for index in range(3))
+        assert (plan.supported is not None, plan.reclaimed, plan.released) == tuple(
+            index < completed_phases for index in range(3)
+        )
         assert plan.supported is (None if completed_phases == 0 else True)
     for pool, processor in zip(orchestrator.stage_pools, processors):
         assert pool.get_bound_replica_id("req-transfer") == 0

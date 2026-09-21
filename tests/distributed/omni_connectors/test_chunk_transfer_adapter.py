@@ -2100,6 +2100,7 @@ def test_finish_requests_does_not_wait_for_inflight_send(build_adapter):
 def _exact_cleanup_connector(connector):
     connector.supports_exact_key_cleanup = True
     connector._pending_keys = set()
+    connector.owned_keys.side_effect = lambda: frozenset(connector._pending_keys)
     connector.cleanup_key.side_effect = connector._pending_keys.discard
 
 

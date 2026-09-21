@@ -84,8 +84,8 @@ class StageRequestCleanup:
     client: StagePoolLLMClient
     engine_request_ids: list[str]
     abort_outputs: list[tuple[str, Any]]
+    # None means no valid drain acknowledgement has been received.
     supported: bool | None = None
-    drained: bool = False
     reclaimed: bool = False
     released: bool = False
 
@@ -1283,7 +1283,7 @@ class StagePool:
 
     async def drain_request_cleanup(self, plan: StageRequestCleanup, cancel_id: str) -> None:
         """Retire and drain this stage; preserve the plan unchanged on failure."""
-        if plan.drained:
+        if plan.supported is not None:
             return
         client = self._request_cleanup_client(plan)
         supported = await client.call_utility_async(
@@ -1292,13 +1292,12 @@ class StagePool:
         if not isinstance(supported, bool):
             raise TypeError("abort_request_and_drain must return a boolean transfer-cleanup capability")
         plan.supported = supported
-        plan.drained = True
 
     async def reclaim_request_cleanup(self, plan: StageRequestCleanup, cancel_id: str) -> None:
         """Reclaim after the caller confirms every participating stage drained."""
         if plan.reclaimed:
             return
-        if not plan.drained or plan.supported is None:
+        if plan.supported is None:
             raise RuntimeError("Cannot reclaim request transfer before drain acknowledgement")
         if plan.supported:
             client = self._request_cleanup_client(plan)

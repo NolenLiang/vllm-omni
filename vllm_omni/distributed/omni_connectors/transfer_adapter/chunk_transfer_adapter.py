@@ -1015,11 +1015,18 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             prefix = f"{external_id}_{connector.stage_id}_"
             keys = sorted(
                 key
-                for key in connector._pending_keys.copy()
+                for key in connector.owned_keys()
                 if key.startswith(prefix) and key[len(prefix) :].isascii() and key[len(prefix) :].isdigit()
             )
             for key in keys:
                 connector.cleanup_key(key)
+            logger.debug(
+                "Completed SHM cleanup for %d tracked chunk keys for request %s at stage %s "
+                "(including chunks already consumed)",
+                len(keys),
+                external_id,
+                connector.stage_id,
+            )
             with self._sender_state_lock:
                 token.reclaimed = True
 
