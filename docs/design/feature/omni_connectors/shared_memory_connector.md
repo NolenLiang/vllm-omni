@@ -45,13 +45,14 @@ This makes `SharedMemoryConnector` the simplest connector in the OmniConnector f
 - `put(from_stage, to_stage, put_key, data)`
 - `get(from_stage, to_stage, get_key, metadata=None)`
 - `cleanup(request_id)`
+- `cleanup_key(key)` for coordinated, exact-key reclamation
 - `health()`
 - `close()`
 
 Within the larger system:
 
 - `load_omni_transfer_config()` automatically fills missing edges with `SharedMemoryConnector`.
-- Callers interact with the connector exclusively through the `put()` / `get()` / `cleanup()` contract — the connector does not require caller-specific logic.
+- The transfer adapter owns chunk identities. The connector transports data and reclaims owned keys; it does not decide when a whole request is safe to reclaim.
 
 Compared with the remote Mooncake-based connectors, `SharedMemoryConnector` is intentionally minimal and local-only.
 
@@ -166,18 +167,46 @@ This path is mainly for older code paths and is not the preferred mode for the c
 `put()` writes every serialized payload to shared memory. The connector has no
 inline-payload path or size threshold.
 
-#### 6.2 Cleanup Is Currently Passive
+#### 6.2 Successful Reads and Best-Effort Cleanup
 
-`cleanup()` is currently a no-op. The intended assumption is:
+Successful reads unlink their segment; successful deserialization also removes
+the lock file. The existing `cleanup(request_id)` and `close()` methods perform
+best-effort cleanup of producer-tracked keys. Neither method establishes that
+other stages have stopped using those keys, and neither scans the node's shared
+memory namespace. Generation completing is not sufficient: a downstream stage
+may still need the remaining chunks.
 
-- the consumer reads the segment
-- the underlying shared-memory helpers unlink it
+#### 6.3 Coordinated Session Cancellation
 
-If the consumer never executes `get()`, the shared-memory segment may remain allocated. This means the connector relies on the normal success path for resource reclamation.
+Request-time reclamation is limited to fully admitted, non-resumable,
+session-owned requests with asynchronous chunking, one live local replica per
+stage, data parallel size one, and SHM on all participating stages. Other
+requests retain their existing cancellation path.
 
-#### 6.3 Close Is Currently Minimal
+The orchestrator retains each original stage/client binding and coordinates
+three ordered phases:
 
-`close()` is also a no-op. There is no connector-owned background thread, socket, or memory pool to tear down, so the lifecycle is simple. The trade-off is that `close()` does not scan or recover leaked shared-memory resources.
+1. Retire the request's transfer generation, abort its stage requests, and wait
+   for every stage's outstanding transfer reads and writes to finish. Queued
+   work from the retired generation cannot start new connector operations.
+2. After all stages confirm that transfer I/O has stopped, reclaim exact chunk
+   keys from each producer's own tracking set. `cleanup_key()` ignores an
+   already absent object, but propagates other errors and retains ownership
+   until both the segment and lock are absent.
+3. After all stages reclaim successfully, release the retired generations,
+   commit aborted output state, and release request bindings.
+
+Failed phases retain their original identities and progress for retry; they
+must not select a replacement replica. Overlapping cleanup callers share the
+same work. A failed request does not prevent other targets in the cancellation
+batch from being stopped. Session-close retry additionally requires the
+session layer to retain cancelled request IDs until cleanup succeeds.
+
+This does not change normal completion or stage-local abort terminal delivery:
+a live downstream stage may still require the terminal chunk. Transfer drain
+is not a measurement of GPU kernel completion. Partial admission, process
+crashes, distributed or multi-replica recovery, and other connector backends are
+outside this reclamation protocol.
 
 ### 7. Data Flow in the Pipeline
 
@@ -217,7 +246,8 @@ This is a classic split-control-plane / data-plane design, but constrained to a 
 
 - Same-node only.
 - Full object serialization and deserialization are still required.
-- Resource cleanup depends on the normal consumer path.
+- Outside coordinated session cancellation, unread chunks still depend on a
+  successful consumer or best-effort cleanup.
 - Shared memory capacity is limited by host configuration.
 
 ### 9. Summary

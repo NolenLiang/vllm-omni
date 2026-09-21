@@ -8,7 +8,8 @@ import threading
 import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Iterable, Mapping
-from typing import Any
+from concurrent.futures import Future
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from vllm.v1.metrics.stats import PrefillStats
@@ -24,6 +25,9 @@ from ..utils.initialization import resolve_connector_spec
 from ..utils.kv_utils import get_local_tp_rank, get_omni_replica_id
 from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
+
+if TYPE_CHECKING:
+    from ..connectors.shm_connector import SharedMemoryConnector
 
 logger = get_connector_logger(__name__)
 
@@ -44,15 +48,21 @@ class _SenderGeneration:
         # was up. The terminal task owes that cleanup once it is done with the
         # connector -- on every exit path, including a failed or raising put.
         self.cleanup_deferred = False
+        self.cancel_id: str | None = None
+        self.drained: Future[None] | None = None
+        self.drain_ready = False
+        self.reclaimed = False
+        self.reclaim_lock = threading.Lock()
 
 
 class _LoadEntry:
     """Identify one receiver registration across queue and I/O boundaries."""
 
-    __slots__ = ("request", "source_metadata")
+    __slots__ = ("request", "source_metadata", "retired")
 
     def __init__(self, request: Request) -> None:
         self.request = request
+        self.retired = False
         sender_info = getattr(request, "payload_sender_info", None)
         self.source_metadata = None
         if isinstance(sender_info, dict):
@@ -147,6 +157,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # polled. Per-registration identity lets the receiver reject an old
         # segment's queued or in-flight work after the same request id resumes.
         self._registered_load_entries: dict[str, _LoadEntry] = {}
+        self._active_load_entry: _LoadEntry | None = None
         self._sender_tokens: dict[str, _SenderGeneration] = {}
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         (
@@ -325,7 +336,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return
         if not hasattr(request, "additional_information"):
             request.additional_information = None
-        with self._receiver_state_lock:
+        # Admission and retirement use sender -> receiver lock order. Neither
+        # lock is held during connector I/O or Future completion callbacks.
+        with self._sender_state_lock, self._receiver_state_lock:
+            token = self._sender_tokens.get(request.external_req_id)
+            if token is not None and token.cancel_id is not None:
+                raise RuntimeError("Cannot load a transfer pending cancellation cleanup")
             request_id = request.request_id
             if request_id in self._registered_load_entries:
                 return
@@ -493,11 +509,22 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         target_stage_id = stage_id - 1
         req_id = request.request_id
         with self._receiver_state_lock:
-            if self._registered_load_entries.get(req_id) is not entry:
+            if entry.retired or self._registered_load_entries.get(req_id) is not entry:
                 return True
+            self.request_ids_mapping[req_id] = entry.external_req_id
             chunk_id = self.get_req_chunk[req_id]
-            external_req_id = self.request_ids_mapping.get(req_id, req_id)
-        connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
+            self._active_load_entry = entry
+        try:
+            return self._poll_registered_entry(entry, stage_id, target_stage_id, req_id, chunk_id)
+        finally:
+            with self._receiver_state_lock:
+                if self._active_load_entry is entry:
+                    self._active_load_entry = None
+            self._complete_transfer_drain(entry.external_req_id)
+
+    def _poll_registered_entry(self, entry, stage_id, target_stage_id, req_id, chunk_id):
+        request = entry.request
+        connector_get_key = f"{entry.external_req_id}_{target_stage_id}_{chunk_id}"
 
         # Use timeout=0 for non-blocking poll
         try:
@@ -510,13 +537,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         except Exception as e:
             logger.error(f"SharedMemoryConnector get failed for req {connector_get_key}: {e}")
             with self._receiver_state_lock:
-                if self._registered_load_entries.get(req_id) is not entry:
+                if entry.retired or self._registered_load_entries.get(req_id) is not entry:
                     return True
             return False
 
         if result is None:
             with self._receiver_state_lock:
-                if self._registered_load_entries.get(req_id) is not entry:
+                if entry.retired or self._registered_load_entries.get(req_id) is not entry:
                     return True
             return False
 
@@ -524,7 +551,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # cleanup_receiver() can run while connector.get() is in flight.
             # Treat cleanup as a commit barrier: a late chunk must not recreate
             # prompt/window state for the removed request.
-            if self._registered_load_entries.get(req_id) is not entry:
+            if entry.retired or self._registered_load_entries.get(req_id) is not entry:
                 return True
             is_success = self._commit_received_chunk(
                 request,
@@ -676,8 +703,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         external_req_id = request.external_req_id
         sender_token = task.get("sender_token")
         if sender_token is None:
-            self._send_single_request_for_generation(task)
-            return
+            # Legacy direct callers still participate in in-flight accounting.
+            # Production queued tasks receive their token in save_async.
+            with self._sender_state_lock:
+                sender_token = self._sender_tokens.setdefault(external_req_id, _SenderGeneration())
+                task["sender_token"] = sender_token
         is_terminal_task = bool(task.get("is_finished"))
         with self._sender_state_lock:
             is_current = self._sender_tokens.get(external_req_id) is sender_token
@@ -687,7 +717,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # deadline -- the hang this fence exists to prevent (#6670).
             # Losing ownership of the external id still vetoes: the state the
             # chunk describes then belongs to a different generation.
-            if is_current and (is_terminal_task or not sender_token.cancelled):
+            if is_current and sender_token.cancel_id is None and (is_terminal_task or not sender_token.cancelled):
                 sender_token.in_flight = True
             else:
                 is_current = False
@@ -707,9 +737,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             with self._sender_state_lock:
                 if self._sender_tokens.get(external_req_id) is sender_token:
                     sender_token.in_flight = False
-                    if sender_token.cancelled and not sender_token.terminal_pending:
+                    if sender_token.cancelled and not sender_token.terminal_pending and sender_token.cancel_id is None:
                         self._sender_tokens.pop(external_req_id, None)
                         self._clear_sender_state_locked(external_req_id)
+            self._complete_transfer_drain(external_req_id)
 
     def _release_terminal_fence(self, external_req_id: str, sender_token: _SenderGeneration) -> None:
         """Drop the terminal fence and run the cleanup it deferred.
@@ -730,6 +761,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             still_current = self._sender_tokens.get(external_req_id) is sender_token
         if deferred and still_current:
             self.cleanup_sender(external_req_id)
+        self._complete_transfer_drain(external_req_id)
 
     def _sender_generation_is_active(
         self,
@@ -742,7 +774,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             if self._sender_tokens.get(external_req_id) is not sender_token:
                 return False
             # Terminal chunks outlive cancellation -- see _send_single_request.
-            return is_terminal or not sender_token.cancelled
+            return sender_token.cancel_id is None and (is_terminal or not sender_token.cancelled)
 
     def _send_single_request_for_generation(
         self,
@@ -898,6 +930,110 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     # Cleanup
     ########################################################################
 
+    def is_transfer_retiring(self, external_id: str) -> bool:
+        """Whether EngineCore admission must reject reuse of this external ID."""
+        with self._sender_state_lock:
+            token = self._sender_tokens.get(external_id)
+            return token is not None and token.cancel_id is not None
+
+    def retire_transfer(self, external_id: str, cancel_id: str) -> Future[None]:
+        """Fence one full-pipeline cancellation; never wait on the scheduler.
+
+        The caller must abort all stages, await all returned Futures, reclaim
+        every stage, then release. Ordinary/local finish must not use this
+        interface: its queued terminal is still owed to a live downstream.
+        """
+        if getattr(self.connector, "supports_exact_key_cleanup", False) is not True:
+            raise NotImplementedError("Connector does not support exact-key reclamation")
+        if not external_id or not cancel_id:
+            raise ValueError("Transfer cancellation requires nonempty IDs")
+        with self._sender_state_lock, self._receiver_state_lock:
+            token = self._sender_tokens.get(external_id)
+            if token is None:
+                # Natural sender completion can leave unread connector keys.
+                token = self._sender_tokens[external_id] = _SenderGeneration()
+            if token.cancel_id is not None and token.cancel_id != cancel_id:
+                raise RuntimeError("Transfer belongs to a different cancellation")
+            token.cancel_id = cancel_id
+            token.cancelled = True
+            if token.drained is None:
+                token.drained = Future()
+                token.drained.set_running_or_notify_cancel()
+            for entry in self._registered_load_entries.values():
+                if entry.external_req_id == external_id:
+                    entry.retired = True
+            active = self._active_load_entry
+            if active is not None and active.external_req_id == external_id:
+                active.retired = True
+            future = token.drained
+        self._complete_transfer_drain(external_id)
+        return future
+
+    def _complete_transfer_drain(self, external_id: str) -> None:
+        future: Future[None] | None = None
+        with self._sender_state_lock, self._receiver_state_lock:
+            token = self._sender_tokens.get(external_id)
+            if token is None or token.drained is None or token.drain_ready:
+                return
+            active = self._active_load_entry
+            if (
+                token.in_flight
+                or token.terminal_pending
+                or (active is not None and active.external_req_id == external_id)
+            ):
+                return
+            # Claim completion once while locked; callbacks run outside locks.
+            token.drain_ready = True
+            future = token.drained
+        future.set_result(None)
+
+    def reclaim_transfer(self, external_id: str, cancel_id: str) -> None:
+        """Reclaim local SHM after ALL stages drained; retain failures for retry.
+
+        Only inspect this connector's owned-key ledger, never process-wide
+        SHM names. Exact-key cleanup performs no peer wait or lock acquisition.
+        """
+        with self._sender_state_lock:
+            token = self._sender_tokens.get(external_id)
+            if token is None or token.cancel_id != cancel_id:
+                raise RuntimeError("Transfer belongs to a different cancellation")
+        with token.reclaim_lock:
+            with self._sender_state_lock:
+                if self._sender_tokens.get(external_id) is not token:
+                    raise RuntimeError("Transfer cancellation was already released")
+                if token.drained is None or not token.drained.done():
+                    raise RuntimeError("Transfer I/O has not drained")
+                token.drained.result()
+                if token.reclaimed:
+                    return
+            # The orchestrator restricts this protocol to SHM deployments;
+            # the base adapter leaves its factory-created connector untyped.
+            connector = cast("SharedMemoryConnector", self.connector)
+            prefix = f"{external_id}_{connector.stage_id}_"
+            keys = sorted(
+                key
+                for key in connector._pending_keys.copy()
+                if key.startswith(prefix) and key[len(prefix) :].isascii() and key[len(prefix) :].isdigit()
+            )
+            for key in keys:
+                connector.cleanup_key(key)
+            with self._sender_state_lock:
+                token.reclaimed = True
+
+    def release_transfer(self, external_id: str, cancel_id: str) -> None:
+        """After global reclaim succeeds, free only this cancellation generation."""
+        with self._sender_state_lock, self._receiver_state_lock:
+            token = self._sender_tokens.get(external_id)
+            if token is None or token.cancel_id != cancel_id:
+                return  # A late release must not touch a successor generation.
+            if not token.reclaimed:
+                raise RuntimeError("Transfer reclamation has not succeeded")
+            for request_id, entry in list(self._registered_load_entries.items()):
+                if entry.external_req_id == external_id and entry.retired:
+                    self._clear_receiver_state_locked(request_id)
+            self._sender_tokens.pop(external_id)
+            self._clear_sender_state_locked(external_id)
+
     def cleanup_receiver(self, request_id: str) -> None:
         """Reclaim receiver-side per-request state (keyed by internal id).
 
@@ -965,6 +1101,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             sender_token = self._sender_tokens.get(external_req_id)
             if sender_token is None:
                 self._clear_sender_state_locked(external_req_id)
+                return
+            if sender_token.cancel_id is not None:
+                # Keep this generation's ownership through drain/reclaim and
+                # release; normal/local cleanup retains its existing behavior.
                 return
             if sender_token.terminal_pending:
                 # A request-terminal chunk is still queued. Reclaiming the
