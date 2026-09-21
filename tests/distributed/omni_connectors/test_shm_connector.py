@@ -222,11 +222,15 @@ class TestCleanup:
         if consumed:
             assert consumer.get("0", "1", key)[0] == {"target": True}
         assert key in producer._pending_keys
+        owned = producer.owned_keys()
+        assert owned == frozenset({key, neighbor})
 
         producer.cleanup_key(key)
         producer.cleanup_key(key)
 
         assert key not in producer._pending_keys
+        assert producer.owned_keys() == frozenset({neighbor})
+        assert owned == frozenset({key, neighbor})
         assert not os.path.exists(f"/dev/shm/{key}")
         assert not os.path.exists(f"/dev/shm/shm_{key}_lockfile.lock")
         assert consumer.get("0", "1", neighbor)[0] == {"neighbor": True}

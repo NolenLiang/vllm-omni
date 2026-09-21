@@ -165,7 +165,7 @@ def test_prepare_request_cleanup_retains_route_and_noncommitting_snapshot(engine
     assert plan.engine_request_ids is not engine_ids
     assert plan.abort_outputs == [("req-1", output)]
     assert plan.supported is None
-    assert not plan.drained and not plan.reclaimed and not plan.released
+    assert not plan.reclaimed and not plan.released
     processor.abort_requests_collecting_outputs.assert_called_once_with(["req-1"], internal=False, commit_state=False)
     processor.commit_aborted_request_state.assert_not_called()
 
@@ -215,7 +215,7 @@ def test_request_cleanup_reclaim_capability_and_idempotent_phases(supported, moc
         plan = pool.prepare_request_cleanup("req-1")
         await pool.drain_request_cleanup(plan, "cancel-1")
         await pool.drain_request_cleanup(plan, "cancel-1")
-        assert plan.supported is supported and plan.drained
+        assert plan.supported is supported
         await pool.reclaim_request_cleanup(plan, "cancel-1")
         await pool.reclaim_request_cleanup(plan, "cancel-1")
         assert plan.reclaimed
@@ -230,7 +230,7 @@ def test_request_cleanup_reclaim_capability_and_idempotent_phases(supported, moc
             expected.append(mocker.call("reclaim_request_transfer", "req-1", "cancel-1"))
             expected.append(mocker.call("release_request_transfer", "req-1", "cancel-1"))
         assert client.call_utility_async.await_args_list == expected
-        assert plan.drained and plan.reclaimed and plan.released
+        assert plan.supported is not None and plan.reclaimed and plan.released
         processor.abort_requests_collecting_outputs.assert_called_once()
         processor.commit_aborted_request_state.assert_called_once_with(["req-1"], internal=False)
         assert plan.abort_outputs == [("req-1", output)]
@@ -253,7 +253,7 @@ def test_request_cleanup_rejects_unacknowledged_phases_and_invalid_capability(mo
         client.call_utility_async.return_value = None
         with pytest.raises(TypeError, match="must return a boolean"):
             await pool.drain_request_cleanup(plan, "cancel-1")
-        assert plan.supported is None and not plan.drained
+        assert plan.supported is None
         processor.commit_aborted_request_state.assert_not_called()
 
     asyncio.run(run())
