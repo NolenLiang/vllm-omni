@@ -438,7 +438,8 @@ async def test_aura_forward_failure_keeps_the_session() -> None:
     from vllm_omni.model_executor.models.aura_omni.duplex.plugin import AuraDuplexPlugin
 
     orchestrator, clients, rpc_q, output_q = _build(stages=2, plugin=AuraDuplexPlugin(_encode_audio))
-    await _open(orchestrator, rpc_q)
+    output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+    await _open(orchestrator, rpc_q, output_buffer=output_buffer)
     request_id = next(iter(orchestrator.request_states))
     await _submit(orchestrator, _append_audio())
     request_state = orchestrator.request_states[request_id]
@@ -452,7 +453,8 @@ async def test_aura_forward_failure_keeps_the_session() -> None:
     assert request_id not in orchestrator.request_states
     assert SESSION_ID in orchestrator.session_manager.runners
     assert session.state != DuplexSessionState.CLOSED
-    types = [message.event.type for message in [output_q.get_nowait() for _ in range(output_q.qsize())]]
+    types = [(await output_buffer.get()).type for _ in range(output_buffer.pending_events)]
+    types.extend(output_q.get_nowait().event.type for _ in range(output_q.qsize()))
     assert "error" in types
     assert "session.expired" not in types
     await orchestrator.session_manager.shutdown()

@@ -39,7 +39,7 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_resource_request_id,
 )
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
-from vllm_omni.engine.duplex.events import DuplexEvent
+from vllm_omni.engine.duplex.events import AudioDelta, DuplexEvent
 from vllm_omni.engine.duplex.messages import (
     CloseDuplexSessionMessage,
     DuplexControlResultMessage,
@@ -73,6 +73,8 @@ class RecordingStagePort(DuplexStagePort):
         self.submissions: list[DuplexStageSubmission] = []
         self.cleanups: list[tuple[list[str], bool]] = []
         self.aborts: list[list[str]] = []
+        self.abort_started = asyncio.Event()
+        self.abort_gate: asyncio.Event | None = None
         self.fail_submit: Exception | None = None
         #: When set, ``submit`` parks on it after signalling ``submit_started``.
         self.submit_gate: asyncio.Event | None = None
@@ -106,6 +108,9 @@ class RecordingStagePort(DuplexStagePort):
 
     async def abort_requests(self, request_ids: list[str]) -> None:
         self.aborts.append(list(request_ids))
+        self.abort_started.set()
+        if self.abort_gate is not None:
+            await self.abort_gate.wait()
 
 
 def _fake_encode_audio(audio: object, sample_rate_hz: int, response_format: str, speed: float | None) -> str | None:
@@ -734,6 +739,8 @@ async def test_stale_epoch_output_is_dropped_after_barge_in() -> None:
 
 async def test_barge_in_aborts_draining_tts_as_well_as_the_active_request() -> None:
     h = await open_harness()
+    release_abort = asyncio.Event()
+    h.port.abort_gate = release_abort
     try:
         await h.run(append_audio())
         request_id = h.stage0_request_id()
@@ -754,7 +761,24 @@ async def test_barge_in_aborts_draining_tts_as_well_as_the_active_request() -> N
         h.session.request_resources[(1, "still-live")] = DuplexRequestResource(
             stage_id=1, request_id="still-live", fence=older, submitted=True
         )
-        events = await h.run(commands.BargeIn())
+        h.manager.emit(
+            h.session,
+            [
+                AudioDelta(response_id="resp-old", delta="AAAA"),
+                AudioDelta(response_id="resp-old", delta="BBBB"),
+                AudioDelta(response_id=h.session.active_response_id, delta="CCCC"),
+            ],
+        )
+        held = await h.output_buffer.get()
+        assert held is not None and h.output_buffer.is_valid(held)
+        h.submit(commands.BargeIn())
+        await asyncio.wait_for(h.port.abort_started.wait(), timeout=2.0)
+        # Both queued audio and an event held by the consumer become stale
+        # before the stage abort can yield, including the older draining turn.
+        assert not h.output_buffer.is_valid(held)
+        assert h.output_buffer.pending_events == 0
+        release_abort.set()
+        events = await h.settle()
         assert h.port.aborts == [[request_id, "duplex-drain-tts"]]
         assert not h.session.is_draining_request("duplex-drain-tts")
         done_ids = [
@@ -768,6 +792,36 @@ async def test_barge_in_aborts_draining_tts_as_well_as_the_active_request() -> N
         assert (0, request_id) not in h.session.request_resources
         assert (1, "still-live") in h.session.request_resources
     finally:
+        release_abort.set()
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_close_invalidates_draining_audio_before_stage_abort_finishes() -> None:
+    h = await open_harness()
+    release_abort = asyncio.Event()
+    h.port.abort_gate = release_abort
+    try:
+        h.session.bind_draining_request("duplex-drain-tts", "resp-old")
+        h.manager.emit(
+            h.session,
+            [AudioDelta(response_id="resp-old", delta="AAAA"), AudioDelta(response_id="resp-old", delta="BBBB")],
+        )
+        held = await h.output_buffer.get()
+        assert held is not None and h.output_buffer.is_valid(held)
+        h.submit(commands.CloseSession())
+        await asyncio.wait_for(h.port.abort_started.wait(), timeout=2.0)
+        # Session close suppresses audio.cancelled notifications; it must still
+        # invalidate the pending output without relying on those later events.
+        assert not h.output_buffer.is_valid(held)
+        assert h.output_buffer.pending_events == 0
+        assert h.port.aborts == [["duplex-drain-tts"]]
+        release_abort.set()
+        events = await h.settle()
+        assert "session.closed" in types(events)
+        assert h.manager.active_count() == 0
+    finally:
+        release_abort.set()
         await close_harness(h)
 
 

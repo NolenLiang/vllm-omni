@@ -309,7 +309,7 @@ class DuplexSessionManager:
             if modality_error is not None:
                 self.emit(
                     session,
-                    self._error_event("invalid_input_modality", modality_error, command=command),
+                    [self._error_event("invalid_input_modality", modality_error, command=command)],
                 )
                 return
             limit = int(self.runtime_config.max_pending_input_bytes_per_session)
