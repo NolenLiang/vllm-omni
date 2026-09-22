@@ -372,11 +372,6 @@ class DuplexEngineSession:
         }
         return stale
 
-    def cancel_fence(self, cancelled_fence: DuplexFence, next_fence: DuplexFence) -> list[str]:
-        stale = self.prepare_cancel_fence(cancelled_fence, next_fence)
-        self.release_fence(cancelled_fence)
-        return stale
-
     def prepare_cancel_fence(self, cancelled_fence: DuplexFence, next_fence: DuplexFence) -> list[str]:
         """Advance the cancellation fence without dropping cleanup records."""
         current = self.accepted_fence
