@@ -375,28 +375,20 @@ class DuplexEngineSession:
         }
         return stale
 
-    def release_resources_for_request_ids(
-        self, request_ids: Iterable[str]
-    ) -> list[str]:
+    def release_resources_for_request_ids(self, request_ids: Iterable[str]) -> list[str]:
         """Drop bindings for these request ids, whichever fence they sit on.
 
         Fence-scoped cancellation only releases the fence being cancelled.
         Overlapped draining output stages belong to an older turn fence and
         would otherwise stay until the session closes.
         """
-        wanted = {
-            request_id
-            for request_id in request_ids
-            if isinstance(request_id, str) and request_id
-        }
+        wanted = {request_id for request_id in request_ids if isinstance(request_id, str) and request_id}
         if not wanted:
             return []
 
         released = list(
             dict.fromkeys(
-                resource.request_id
-                for resource in self.request_resources.values()
-                if resource.request_id in wanted
+                resource.request_id for resource in self.request_resources.values() if resource.request_id in wanted
             )
         )
         self.request_resources = {
@@ -415,10 +407,7 @@ class DuplexEngineSession:
         current = self.accepted_fence
         if cancelled_fence.session_id != self.session_id:
             raise DuplexFenceMismatchError(current, cancelled_fence)
-        if (
-            next_fence.session_id != self.session_id
-            or next_fence.epoch <= cancelled_fence.epoch
-        ):
+        if next_fence.session_id != self.session_id or next_fence.epoch <= cancelled_fence.epoch:
             raise DuplexFenceMismatchError(cancelled_fence, next_fence)
         current_key = (current.epoch, current.turn_id)
         cancelled_key = (cancelled_fence.epoch, cancelled_fence.turn_id)
