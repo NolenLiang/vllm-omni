@@ -1081,7 +1081,7 @@ async def test_append_admission_counts_audio_and_video_frame_bytes() -> None:
     """Manager reserves len(audio)+Σlen(frame); video bytes count toward the same limit."""
     async with Harness.create(max_sessions=1, max_pending_input_bytes_per_session=20) as harness:
         await harness.open("sid-av")
-        harness.events()
+        await harness.events()
         session = harness.session("sid-av")
         runner = harness.manager.runners["sid-av"]
         gate = asyncio.Event()
@@ -1104,7 +1104,7 @@ async def test_append_admission_counts_audio_and_video_frame_bytes() -> None:
             "sid-av",
             AppendAudio(audio=b"x" * 10, video_frames=("yyyyyyyyyy",), event_id="evt-over"),
         )
-        errors = [event for event in harness.events("sid-av") if isinstance(event, ErrorEvent)]
+        errors = [event for event in await harness.events("sid-av") if isinstance(event, ErrorEvent)]
         assert [error.code for error in errors] == ["input_backpressure"]
         assert errors[0].related_event_id == "evt-over"
         assert session.pending_input_bytes == expected
