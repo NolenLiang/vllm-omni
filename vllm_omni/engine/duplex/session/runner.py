@@ -1484,6 +1484,8 @@ class DuplexSessionRunner:
             session.release_resources_for_request_ids(older_abort_ids)
         new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
         self.manager.invalidate_output(session.session_id, old_response_id, through_epoch=old_epoch)
+        for response_id, _, _ in draining_cancels:
+            self.manager.invalidate_output(session.session_id, response_id, through_epoch=old_epoch)
         if old_request_id is not None:
             # Release projector/parser cursors so cancelled epochs do not
             # accumulate until the whole session closes.
