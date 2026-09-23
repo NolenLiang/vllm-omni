@@ -2055,26 +2055,40 @@ def _transfer_cleanup_orchestrator(mocker: MockerFixture, request_ids=("req-tran
 
 
 @pytest.mark.asyncio
-async def test_native_data_plane_abort_keeps_ordinary_cleanup(mocker: MockerFixture) -> None:
+@pytest.mark.parametrize(
+    ("use_v2", "supports_native", "expect_retirement"),
+    [(True, True, False), (True, False, True), (False, True, True), (False, False, True)],
+)
+async def test_abort_keeps_cleanup_with_transport_owner(
+    mocker: MockerFixture, use_v2: bool, supports_native: bool, expect_retirement: bool
+) -> None:
     orchestrator, clients, _processors = _transfer_cleanup_orchestrator(mocker)
     model_config = orchestrator.stage_pools[1].stage_vllm_config.model_config
-    model_config.use_v2_model_runner = True
-    model_config.supports_native_mrv2_data_plane = True
+    model_config.use_v2_model_runner = use_v2
+    model_config.supports_native_mrv2_data_plane = supports_native
     # Native MRV2 owns transport on the worker, without a scheduler adapter.
-    clients[1].call_utility_async.return_value = False
+    clients[1].call_utility_async.return_value = expect_retirement
     state = orchestrator.request_states["req-transfer"]
 
-    await orchestrator._handle_abort(AbortRequestMessage(request_ids=["req-transfer"], rpc_id="abort-native"))
+    await orchestrator._handle_abort(AbortRequestMessage(request_ids=["req-transfer"], rpc_id="abort-owner"))
 
     result = orchestrator.rpc_async_queue.get_nowait()
     assert isinstance(result, AbortResultMessage)
-    assert result.rpc_id == "abort-native" and result.success, result.error
-    assert state.transfer_cleanup is None
+    assert result.rpc_id == "abort-owner" and result.success, result.error
     assert "req-transfer" not in orchestrator.request_states
+    assert (state.transfer_cleanup is not None) is expect_retirement
     for pool, client in zip(orchestrator.stage_pools, clients):
-        assert client.abort_calls == [["req-transfer"]]
-        client.call_utility_async.assert_not_awaited()
         assert pool.get_bound_replica_id("req-transfer") is None
+        if expect_retirement:
+            assert client.abort_calls == []
+            assert [call.args[0] for call in client.call_utility_async.await_args_list] == [
+                "abort_request_and_drain",
+                "reclaim_request_transfer",
+                "release_request_transfer",
+            ]
+        else:
+            assert client.abort_calls == [["req-transfer"]]
+            client.call_utility_async.assert_not_awaited()
 
 
 @pytest.mark.asyncio

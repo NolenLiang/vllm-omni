@@ -35,6 +35,7 @@ from vllm.v1.engine import EngineCoreOutputs, FinishReason
 from vllm.v1.engine.exceptions import EngineDeadError
 from vllm.v1.metrics.stats import IterationStats
 
+from vllm_omni.core.sched.omni_scheduling_coordinator import uses_native_mrv2_data_plane
 from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.distributed.omni_connectors.utils.config import stage_receives_chunks
 from vllm_omni.engine import OmniEngineCoreRequest
@@ -644,6 +645,7 @@ class OrchestratorBase:
     def _can_drain_request_transfers(self, state: OrchestratorRequestState) -> bool:
         # Limit reclamation to fully admitted, non-resumable session requests.
         # Partial admission, distributed routing and DP require a wider protocol.
+        # Native MRV2 transport belongs to the worker, not the scheduler adapter.
         if not self.async_chunk or not state.session_owned or state.streaming.enabled or not self.stage_pools:
             return False
         for pool in self.stage_pools:
@@ -662,6 +664,10 @@ class OrchestratorBase:
                 or pool.stage_id not in state.stage_submit_ts
                 or getattr(getattr(config, "parallel_config", None), "data_parallel_size", None) != 1
                 or not getattr(model_config, "async_chunk", False)
+                or uses_native_mrv2_data_plane(
+                    model_config,
+                    use_v2_model_runner=getattr(model_config, "use_v2_model_runner", False),
+                )
                 or connector_name != "SharedMemoryConnector"
             ):
                 return False

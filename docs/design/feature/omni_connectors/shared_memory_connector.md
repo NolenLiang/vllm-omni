@@ -181,8 +181,9 @@ may still need the remaining chunks.
 
 Request-time reclamation is limited to fully admitted, non-resumable,
 session-owned requests with asynchronous chunking, one live local replica per
-stage, data parallel size one, and SHM on all participating stages. Other
-requests retain their existing cancellation path.
+stage, data parallel size one, and SHM through scheduler-owned chunk adapters on
+all participating stages. Native MRV2 stages own transport in the worker and
+retain their existing cancellation path, as do other ineligible requests.
 
 The orchestrator retains each original stage/client binding and coordinates
 three ordered phases:
