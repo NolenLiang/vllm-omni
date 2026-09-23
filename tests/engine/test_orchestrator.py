@@ -2023,6 +2023,8 @@ def _transfer_cleanup_orchestrator(mocker: MockerFixture, request_ids=("req-tran
                 max_model_len=64,
                 async_chunk=True,
                 stage_connector_config={"name": "SharedMemoryConnector"},
+                use_v2_model_runner=False,
+                supports_native_mrv2_data_plane=False,
             ),
             parallel_config=mocker.Mock(spec=ParallelConfig, data_parallel_size=1),
         )
@@ -2050,6 +2052,29 @@ def _transfer_cleanup_orchestrator(mocker: MockerFixture, request_ids=("req-tran
             stage_submit_ts={stage_id: 1.0 for stage_id in range(3)},
         )
     return orchestrator, clients, processors
+
+
+@pytest.mark.asyncio
+async def test_native_data_plane_abort_keeps_ordinary_cleanup(mocker: MockerFixture) -> None:
+    orchestrator, clients, _processors = _transfer_cleanup_orchestrator(mocker)
+    model_config = orchestrator.stage_pools[1].stage_vllm_config.model_config
+    model_config.use_v2_model_runner = True
+    model_config.supports_native_mrv2_data_plane = True
+    # Native MRV2 owns transport on the worker, without a scheduler adapter.
+    clients[1].call_utility_async.return_value = False
+    state = orchestrator.request_states["req-transfer"]
+
+    await orchestrator._handle_abort(AbortRequestMessage(request_ids=["req-transfer"], rpc_id="abort-native"))
+
+    result = orchestrator.rpc_async_queue.get_nowait()
+    assert isinstance(result, AbortResultMessage)
+    assert result.rpc_id == "abort-native" and result.success, result.error
+    assert state.transfer_cleanup is None
+    assert "req-transfer" not in orchestrator.request_states
+    for pool, client in zip(orchestrator.stage_pools, clients):
+        assert client.abort_calls == [["req-transfer"]]
+        client.call_utility_async.assert_not_awaited()
+        assert pool.get_bound_replica_id("req-transfer") is None
 
 
 @pytest.mark.asyncio
