@@ -1780,11 +1780,13 @@ async def test_an_open_cancelled_after_admission_releases_the_runner_and_its_sta
                     control_id="open-cancelled",
                     session_id="sid-cancelled",
                     session_config=DuplexSessionConfig(model="fake-model"),
+                    output_buffer=DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512),
                 )
             )
         )
         await asyncio.wait_for(sink.entered.wait(), timeout=1.0)
         assert "sid-cancelled" in harness.manager.runners
+        assert "sid-cancelled" in harness.manager._outputs
         assert [context.request_id for context in harness.stage_port.ensure_calls] == [
             stage0_request_id("sid-cancelled")
         ]
@@ -1795,6 +1797,7 @@ async def test_an_open_cancelled_after_admission_releases_the_runner_and_its_sta
         harness.manager._result_sink = original_sink
 
         assert "sid-cancelled" not in harness.manager.runners
+        assert "sid-cancelled" not in harness.manager._outputs
         assert harness.manager.active_count() == 0
         assert harness.stage_port.cleanup_calls == [([stage0_request_id("sid-cancelled")], False)]
         assert stage0_request_id("sid-cancelled") not in harness.manager._request_index
@@ -1819,6 +1822,7 @@ async def test_an_open_cancelled_again_during_its_rollback_leaves_the_stage_clea
                     control_id="open-cancelled-twice",
                     session_id="sid-cancelled",
                     session_config=DuplexSessionConfig(model="fake-model"),
+                    output_buffer=DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512),
                 )
             )
         )
@@ -1834,6 +1838,7 @@ async def test_an_open_cancelled_again_during_its_rollback_leaves_the_stage_clea
 
         open_task.cancel()
         await asyncio.wait_for(shutdown_started.wait(), timeout=1.0)
+        assert "sid-cancelled" not in harness.manager._outputs
         open_task.cancel()  # lands inside the rollback, before the stage cleanup
         with pytest.raises(asyncio.CancelledError):
             await open_task
