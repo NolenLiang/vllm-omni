@@ -1071,6 +1071,105 @@ def _stage0_vision_runtime():
     return runtime
 
 
+def _minicpmo_seeded_silence_sampling_case(initial_user_text: str | None, *, force_listen_count: int = 0):
+    from vllm_omni.engine.duplex.contracts import DuplexFence
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import build_duplex_data_plane_prompt
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="sid-seeded-text")
+    runtime_config = {"initial_user_text": initial_user_text}
+    runtime._prepare_session_context(state, {"instructions": "Speak exactly."}, runtime_config=runtime_config)
+    prefill = runtime._stage_prefill_embeddings_only(
+        state, np.zeros(4, dtype=np.float32), epoch=0, seq=1, is_speech=False
+    )
+    assert prefill["success"] is True
+    prompt = build_duplex_data_plane_prompt(
+        request_id="req-seeded-text",
+        fence=DuplexFence(state.session_id),
+        session_config={"extra_body": {"force_listen_count": force_listen_count}},
+        runtime_config=runtime_config,
+        seq=1,
+        turn_seq=1,
+        payload={"type": "audio", "is_speech": False},
+        final=False,
+    )
+    payload = prompt["model_intermediate_buffer"]["duplex"]["payload"]
+    model, row = _minicpmo_duplex_policy_case(state, payload)
+    model._minicpmo45_native_duplex_token_ids_cache = runtime._special_token_ids()
+    return runtime, state, model, row
+
+
+@pytest.mark.parametrize("initial_user_text", [None, "", "Get the trust fund to the bank early."])
+@pytest.mark.parametrize("force_listen_count", [0, 1])
+def test_minicpmo_seeded_text_reaches_sampling_on_silence(initial_user_text, force_listen_count):
+    """A seeded user turn must reach the model despite its silent audio clock."""
+    runtime, state, model, row = _minicpmo_seeded_silence_sampling_case(
+        initial_user_text, force_listen_count=force_listen_count
+    )
+    logits = torch.zeros((1, 32), dtype=torch.float32)
+    logits[0, 20] = 10.0
+    original_logits = logits.clone()
+
+    model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
+
+    if initial_user_text and not force_listen_count:
+        assert torch.equal(logits, original_logits)
+        assert state.pending_speech_context is True
+    else:
+        assert logits[0, runtime.listen_token_id] == 0
+        assert torch.isfinite(logits).sum() == 1
+
+
+def test_minicpmo_seeded_text_is_consumed_before_post_turn_silence():
+    """The opening text allows one answer; silence after its end stays quiet."""
+    from dataclasses import replace
+
+    runtime, state, model, row = _minicpmo_seeded_silence_sampling_case("Read this sentence.")
+    token_ids = runtime._special_token_ids()
+    logits = torch.zeros((1, 32), dtype=torch.float32)
+    model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
+    assert torch.isfinite(logits).all()
+
+    model._record_minicpmo45_duplex_terminator(0, runtime.tts_bos_token_id, token_ids)
+    assert state.pending_speech_context is True
+    model._record_minicpmo45_duplex_terminator(0, 20, token_ids)
+    assert state.pending_speech_context is False
+    model._record_minicpmo45_duplex_terminator(0, runtime.turn_eos_token_id, token_ids)
+    assert state.current_turn_ended is True
+
+    prefill = runtime._stage_prefill_embeddings_only(
+        state, np.zeros(4, dtype=np.float32), epoch=0, seq=2, is_speech=False
+    )
+    assert prefill["success"] is True
+    next_logits = torch.zeros((1, 32), dtype=torch.float32)
+    model.prepare_duplex_sampling(next_logits, SimpleNamespace(), (replace(row, seq=row.seq + 1),))
+    assert next_logits[0, runtime.listen_token_id] == 0
+    assert torch.isfinite(next_logits).sum() == 1
+
+
+def test_minicpmo_seeded_text_survives_explicit_initial_listen():
+    """The force-listen prefix delays the seed without losing its answer."""
+    from dataclasses import replace
+
+    runtime, state, model, row = _minicpmo_seeded_silence_sampling_case("Read this sentence.", force_listen_count=1)
+    token_ids = runtime._special_token_ids()
+    logits = torch.zeros((1, 32), dtype=torch.float32)
+    model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
+    assert torch.isfinite(logits).sum() == 1
+    model._record_minicpmo45_duplex_terminator(0, runtime.listen_token_id, token_ids)
+
+    prefill = runtime._stage_prefill_embeddings_only(
+        state, np.zeros(4, dtype=np.float32), epoch=0, seq=2, is_speech=False
+    )
+    assert prefill["success"] is True
+    next_logits = torch.zeros((1, 32), dtype=torch.float32)
+    next_row = replace(row, seq=row.seq + 1, payload={"is_speech": False, "force_listen": False})
+    model.prepare_duplex_sampling(next_logits, SimpleNamespace(), (next_row,))
+    assert torch.isfinite(next_logits).all()
+    assert state.pending_speech_context is True
+
+
 def test_minicpmo_stage0_puts_every_frame_of_an_append_in_one_unit():
     """Official streaming_prefill feeds the whole frame_list into one unit.
 
