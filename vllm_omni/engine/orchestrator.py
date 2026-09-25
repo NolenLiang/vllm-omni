@@ -442,7 +442,7 @@ class OrchestratorBase:
         if self._membership is not None:
             self._membership.install_unregister_handlers(
                 output_queue=self.output_async_queue,
-                cleanup_callback=lambda ids: self._cleanup_request_ids(ids, abort=True),
+                cleanup_callback=lambda ids: self._cleanup_request_ids(ids, abort=True, release_owners=True),
                 replica_removed_callback=self._remove_stage_replica_waiting,
             )
             membership_watcher = self._membership.start()

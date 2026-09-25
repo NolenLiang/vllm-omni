@@ -668,3 +668,83 @@ async def test_sentence_partial_does_not_legacy_forward_the_full_stage_output() 
 def test_default_plugin_declares_no_draining_stages() -> None:
     plugin = MiniCPMO45DuplexPlugin(_encode_audio)
     assert plugin.draining_stage_ids(stage_count=4) == frozenset()
+
+
+@pytest.mark.asyncio
+async def test_membership_unregister_releases_duplex_session_owner(monkeypatch) -> None:
+    """The callback installed by run must expire the owner after remote loss."""
+    from vllm_omni.distributed.omni_coordinator.load_balancer import RoundRobinBalancer
+    from vllm_omni.distributed.omni_coordinator.messages import ReplicaInfo, ReplicaList, ReplicaStatus
+    from vllm_omni.engine import orchestrator as orchestrator_module
+    from vllm_omni.engine.membership_controller import MembershipController
+
+    orchestrator, clients, rpc_q, output_q = _build()
+    input_addr = "tcp://remote-replica:12345"
+    clients[0].client_addresses = {"input_address": input_addr}
+    orchestrator.stage_pools[0].add_client(input_addr, clients[0], replica_id=0)
+
+    class Hub:
+        def get_replica_list(self) -> ReplicaList:
+            return ReplicaList(
+                replicas=[ReplicaInfo(input_addr, "tcp://remote-replica:12346", 0, ReplicaStatus.UP, 0, 0.0, 0.0)],
+                timestamp=0.0,
+            )
+
+        def get_replicas_for_stage(self, stage_id: int) -> ReplicaList:
+            snapshot = self.get_replica_list()
+            return ReplicaList(
+                replicas=[replica for replica in snapshot.replicas if replica.stage_id == stage_id],
+                timestamp=snapshot.timestamp,
+            )
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr("vllm_omni.engine.membership_controller.OmniCoordClientForHub", lambda _addr: Hub())
+    membership = MembershipController(
+        orchestrator.stage_pools,
+        coordinator_pub_address="tcp://coordinator:12347",
+        load_balancer_factory=RoundRobinBalancer,
+        remote_replica_factory=lambda *_args: clients[0],
+    )
+    orchestrator._membership = membership
+    # run() owns a dedicated event loop in production. Keep its final task sweep
+    # from cancelling pytest's existing tasks while retaining all runtime tasks.
+    fixture_tasks = asyncio.all_tasks()
+    scoped_asyncio = SimpleNamespace(**vars(asyncio))
+    scoped_asyncio.all_tasks = lambda loop=None: asyncio.all_tasks(loop) - fixture_tasks
+    monkeypatch.setattr(orchestrator_module, "asyncio", scoped_asyncio)
+    run_task = asyncio.create_task(orchestrator.run())
+    try:
+        # Run the real entry point: the test does not hand-write its cleanup callback.
+        async def wait_for_callback():
+            while membership._cleanup_callback is None:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_callback(), timeout=1)
+        assert (await _open(orchestrator, rpc_q)).ok
+        await _submit(orchestrator, _append_audio())
+        request_id = _stage0_request_id()
+        session = orchestrator.session_manager.get(SESSION_ID)
+        assert session is not None
+        assert not run_task.done(), "orchestrator must still be running before remote loss"
+        assert clients[0].add_request_calls, "the session must have submitted a backend request"
+        assert orchestrator.stage_pools[0]._affinity[request_id] == input_addr
+
+        # The watcher calls this real method once coordinator membership says DOWN.
+        await membership.handle_unregister(0, input_addr)
+        await _settle(orchestrator)
+
+        assert request_id not in orchestrator.request_states, "backend request cleanup must execute"
+        assert orchestrator.session_manager.active_count() == 0, "remote loss retained the duplex admission slot"
+        assert session.state == DuplexSessionState.CLOSED
+        events = [output_q.get_nowait() for _ in range(output_q.qsize())]
+        event_types = [getattr(getattr(event, "event", None), "type", type(event).__name__) for event in events]
+        assert "session.expired" in event_types, f"remote loss needs a public session terminal, got {event_types}"
+        expired = [
+            event.event for event in events if getattr(getattr(event, "event", None), "type", None) == "session.expired"
+        ]
+        assert len(expired) == 1 and expired[0].reason == "request_cleanup"
+    finally:
+        run_task.cancel()
+        await asyncio.gather(run_task, return_exceptions=True)
