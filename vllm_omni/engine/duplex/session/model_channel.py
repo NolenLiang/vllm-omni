@@ -52,6 +52,7 @@ from vllm_omni.engine.duplex.session.context import DuplexSessionContext, StageO
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
+from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallRegistrationError
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats
 from vllm_omni.outputs import OmniRequestOutput
 from vllm_omni.outputs.duplex import attach_duplex_output_decision
@@ -848,16 +849,40 @@ class ModelChannel:
             self._fail_response_from_model_error(model_result)
             return close_reason, True
         if model_result.get("function_call") is True:
-            self._out.emit(
-                {
-                    "type": "function_call.done",
-                    "session_id": session.session_id,
-                    "epoch": session.epoch,
-                    "call_id": model_result.get("call_id"),
-                    "name": model_result.get("name"),
-                    "arguments": model_result.get("arguments", ""),
-                }
-            )
+            call_id = model_result.get("call_id")
+            name = model_result.get("name")
+            payload: dict[str, object] = {
+                "type": "function_call.done",
+                "session_id": session.session_id,
+                "epoch": session.epoch,
+                "call_id": call_id,
+                "name": name,
+                "arguments": model_result.get("arguments", ""),
+            }
+            if isinstance(call_id, str) and call_id and isinstance(name, str) and name:
+                # The call is registered before it is exposed, in the same
+                # synchronous step: the ledger is the only admission authority
+                # for the client's answer, so a call it does not hold could
+                # never be answered and must not be projected at all.
+                item_id = f"item_{uuid.uuid4().hex}"
+                call_response_id = f"resp_{uuid.uuid4().hex}"
+                try:
+                    self._ctx.tool_calls.register(
+                        ToolCallOrigin(
+                            call_id=call_id,
+                            epoch=session.epoch,
+                            turn_id=session.turn_id,
+                            response_id=call_response_id,
+                            item_id=item_id,
+                        )
+                    )
+                except ToolCallRegistrationError as exc:
+                    self._out.emit_error(exc.code, str(exc))
+                    await self._close_from_runtime("tool_call_lifecycle")
+                    return close_reason, True
+                payload["item_id"] = item_id
+                payload["response_id"] = call_response_id
+            self._out.emit(payload)
             return close_reason, True
         if model_result.get("requires_stage_handoff") is True or model_result.get("requires_tts_stage") is True:
             # Reserve the protocol response only when Stage1 emits text/audio.

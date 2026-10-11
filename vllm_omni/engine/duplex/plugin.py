@@ -535,6 +535,31 @@ class DuplexModelPlugin(ABC):
         del current, output_metadata
         return None
 
+    def retire_pending_function_output(
+        self,
+        config: DuplexSessionConfig,
+        current: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        """Answer what a cancelled epoch does to an accepted-but-unconsumed result.
+
+        A ``function_call_output`` is accepted into the runtime config, and a
+        frame-locked model may only pick it up on a later frame. When the epoch
+        advances (a cancel or barge-in), that queued result belongs to the
+        generation that was just cancelled and must not be spoken in the next
+        one. Plugins with a queued function channel override this; the default
+        keeps nothing queued and returns ``None`` (no change).
+
+        Returning a config must not reset a monotonic cursor the worker keys
+        its "already consumed" watermark on -- only the queue itself is retired.
+
+        Raising is a fail-closed answer, not a soft error: the framework cannot
+        verify a runtime is clean on its own, so a plugin that cannot retire its
+        queue ends the session rather than let the cancelled generation's result
+        be spoken in the new epoch.
+        """
+        del config, current
+        return None
+
 
 def load_duplex_plugin(path: str, encode_audio: EncodeAudio) -> DuplexModelPlugin:
     module_name, separator, attribute_name = path.rpartition(".")

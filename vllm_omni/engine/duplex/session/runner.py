@@ -55,6 +55,7 @@ from vllm_omni.engine.duplex.config import (
     DuplexPlaybackCommitPolicy,
     DuplexSessionState,
     ResponseCreateOptions,
+    resolve_tool_result_timeout_s,
 )
 from vllm_omni.engine.duplex.contracts import (
     DuplexOutputContext,
@@ -99,6 +100,7 @@ from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
+from vllm_omni.engine.duplex.session.tool_calls import LoopTimerScheduler, ToolCallLedger
 from vllm_omni.engine.duplex.turn_detection import (
     TurnDetectionResult,
 )
@@ -187,6 +189,15 @@ class DuplexSessionRunner:
         self._background_tasks: set[asyncio.Task[None]] = set()
         #: Flags more than one component reads and writes (see session_context).
         self.run = DuplexRunState()
+        #: Function calls this session exposed and their one terminal state each.
+        #: Created before the context because the components read it through the
+        #: context; the timer seam is attached in ``start`` (it needs the loop).
+        self.tool_calls = ToolCallLedger(
+            max_calls=manager.runtime_config.max_tool_calls_per_session,
+            clock=session._clock,
+            timeout_s=resolve_tool_result_timeout_s(session.config.extra_body),
+            on_expire=self._enqueue_tool_call_expiry,
+        )
         self.ctx = DuplexSessionContext(
             session=session,
             model_state=self.model_state,
@@ -196,6 +207,7 @@ class DuplexSessionRunner:
             tasks=self.tasks,
             run=self.run,
             services=self,
+            tool_calls=self.tool_calls,
         )
         self.out = SessionEmitter(self.ctx, promote_deferred_overlap=self._promote_deferred_overlap_later)
         self.model = ModelChannel(
@@ -218,6 +230,7 @@ class DuplexSessionRunner:
 
     def start(self) -> None:
         self._loop = asyncio.get_running_loop()
+        self.tool_calls.set_scheduler(LoopTimerScheduler(self._loop))
         session = self.session
         if self.out.projector is None:
             default_payload = session.config.extra_body.get("realtime_session_payload")
@@ -444,6 +457,7 @@ class DuplexSessionRunner:
         if active_response_task is not None and not active_response_task.done():
             active_response_task.cancel()
             await asyncio.gather(active_response_task, return_exceptions=True)
+        self.tool_calls.close()
         self.session.close()
         await self._stop_worker()
 
@@ -529,6 +543,9 @@ class DuplexSessionRunner:
             return
         if item.kind == "commit":
             await self._on_commit(dict(item.payload))
+            return
+        if item.kind == "tool_call_expiry":
+            self._on_tool_call_expiry(item.payload)
             return
         if item.kind == "run_payload":
             await self._run_internal_payload(dict(item.payload))
@@ -715,6 +732,80 @@ class DuplexSessionRunner:
         )
 
     # ------------------------------------------------------------------ #
+    # Epoch advance / tool-call ledger                                   #
+    # ------------------------------------------------------------------ #
+
+    def _advance_epoch(self) -> tuple[int, dict[str, int]]:
+        """Advance the barge-in epoch and let every epoch-scoped owner observe it.
+
+        The only way the session's epoch moves: an epoch bump is the one
+        statement that means "the model's committed output for the previous
+        generation is void", so the session-owned consequences of it -- pending
+        function calls settling as cancelled, queued tool results the model has
+        not consumed yet being retired -- hang off this call instead of being
+        repeated at each of the seven sites that cancel something.
+        """
+        session = self.session
+        old_epoch = session.epoch
+        new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+        if new_epoch != old_epoch:
+            self.tool_calls.invalidate_epoch(new_epoch)
+            self._retire_pending_function_output()
+        return new_epoch, old_playback
+
+    def _retire_pending_function_output(self) -> None:
+        """Drop tool results the model accepted but never consumed.
+
+        An accepted result is written into the session's runtime config, and
+        some runtimes only apply it on their next frame. Cancelling the epoch
+        under it must not let it speak in the new generation, so the plugin is
+        asked to retire what is still queued.
+        """
+        session = self.session
+        try:
+            candidate = self.plugin.retire_pending_function_output(session.config, dict(session.runtime_config))
+        except Exception as exc:
+            # Failing open would carry the cancelled epoch's queued batches into
+            # the new one, which is precisely what the epoch change voided, and
+            # without the plugin there is no way to prove the runtime is clean.
+            # So the session ends instead: a closed session cannot speak a
+            # result it cancelled.
+            logger.exception("Failed to retire pending function output: %s", exc)
+            self._emit_error(
+                "tool_result_retirement_failed",
+                "the session could not retire a queued tool result for the new epoch",
+            )
+            self._begin_close("tool_result_retirement_failed")
+            self.manager.close_from_runner(self, "tool_result_retirement_failed")
+            return
+        if candidate is not None:
+            session.replace_runtime_config(candidate)
+
+    def _enqueue_tool_call_expiry(self, call_id: str) -> None:
+        """Timer callback: hand the identity back to the mailbox, decide nothing.
+
+        The deadline decision belongs to the mailbox worker (``_on_internal``),
+        so that it is serialized with every other command instead of running in
+        an ``asyncio`` timer callback that could interleave with one.
+        """
+        self._mailbox.put_nowait(_Internal("tool_call_expiry", {"call_id": call_id}))
+
+    def _on_tool_call_expiry(self, payload: dict[str, object]) -> None:
+        call_id = payload.get("call_id")
+        if not isinstance(call_id, str) or not call_id:
+            return
+        if self.run.closing or self.session.state != DuplexSessionState.OPEN:
+            return
+        # Idempotent: a timer that fires after the call settled does nothing.
+        if not self.tool_calls.expire(call_id):
+            return
+        self._emit_error(
+            "tool_result_timeout",
+            f"no function_call_output for {call_id} arrived before tool_result_timeout_s; "
+            "the call was abandoned and a late result is refused",
+        )
+
+    # ------------------------------------------------------------------ #
     # Session lifecycle helpers                                          #
     # ------------------------------------------------------------------ #
 
@@ -722,6 +813,12 @@ class DuplexSessionRunner:
         self.run.closing = True
         self.run.close_reason = self.run.close_reason or reason
         self.session.mark_closing()
+        # Every terminal path funnels through here: the control-RPC close, the
+        # lease expiry, a runtime close raised by the model channel, and the
+        # output-backpressure close. Releasing the call ledger here (rather than
+        # at each of those) is what guarantees no deadline timer outlives the
+        # session it would settle a call for.
+        self.tool_calls.close()
 
     def _session_auto_responds(self) -> bool:
         return self.out.auto_responds()
@@ -765,7 +862,7 @@ class DuplexSessionRunner:
             old_response_id = session.active_response_id
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, old_response_id, committed_ms)
-            new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+            new_epoch, old_playback = self._advance_epoch()
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -783,7 +880,7 @@ class DuplexSessionRunner:
             old_epoch = session.epoch
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, session.last_response_id, committed_ms)
-            new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+            new_epoch, old_playback = self._advance_epoch()
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -1354,7 +1451,7 @@ class DuplexSessionRunner:
             old_response_id = session.active_response_id
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, old_response_id, committed_ms)
-            new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+            new_epoch, old_playback = self._advance_epoch()
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -1372,7 +1469,7 @@ class DuplexSessionRunner:
             old_epoch = session.epoch
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, session.last_response_id, committed_ms)
-            new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+            new_epoch, old_playback = self._advance_epoch()
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -1391,7 +1488,7 @@ class DuplexSessionRunner:
             old_response_id = session.active_response_id
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, old_response_id, committed_ms)
-            new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+            new_epoch, old_playback = self._advance_epoch()
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -1483,7 +1580,7 @@ class DuplexSessionRunner:
         older_abort_ids = [request_id for request_id in abort_ids if request_id not in cancelled_ids]
         if older_abort_ids:
             session.release_resources_for_request_ids(older_abort_ids)
-        new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+        new_epoch, old_playback = self._advance_epoch()
         self.manager.invalidate_output(session.session_id, old_response_id, through_epoch=old_epoch)
         for response_id, _, _ in draining_cancels:
             self.manager.invalidate_output(session.session_id, response_id, through_epoch=old_epoch)
@@ -1544,7 +1641,7 @@ class DuplexSessionRunner:
     def _cancel_pending_input(self, *, reason: str) -> None:
         session = self.session
         cancelled = session.cancel_pending_input()
-        helpers.advance_barge_in_epoch(session)
+        self._advance_epoch()
         self.emit(
             {
                 "type": "input.cancelled",

@@ -18,7 +18,7 @@ supplies ``wait_for_append_tail``.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from copy import deepcopy
 
 from vllm.logger import init_logger
@@ -30,6 +30,7 @@ from vllm_omni.engine.duplex.session.context import DuplexSessionContext
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
+from vllm_omni.engine.duplex.session.tool_calls import ToolCallRejection, ToolCallState
 from vllm_omni.engine.duplex.turn_detection import (
     PendingTurnDetectionUpdate,
     ServerTurnDetector,
@@ -39,6 +40,7 @@ from vllm_omni.engine.duplex.turn_detection import (
     TurnDetectionResult,
     apply_turn_detection_result,
 )
+from vllm_omni.protocol.duplex.events import error_event
 
 logger = init_logger(__name__)
 
@@ -294,34 +296,7 @@ class SessionControl:
         item = payload.get("item") if isinstance(payload, dict) else None
         item_type = item.get("type") if isinstance(item, dict) else None
         if item_type == "function_call_output" and isinstance(item, dict):
-            if not await self._wait_for_append_tail():
-                return
-            try:
-                candidate_runtime_config = self._ctx.plugin.runtime_config_for_function_output(
-                    session.config,
-                    dict(session.runtime_config),
-                    item,
-                )
-            except DuplexRuntimeConfigError as exc:
-                self._out.emit_error(exc.code, str(exc))
-                return
-            if candidate_runtime_config is not None:
-                session.replace_runtime_config(candidate_runtime_config)
-            self._out.emit(
-                {
-                    "type": "conversation.item.created",
-                    "session_id": session.session_id,
-                    "item": item,
-                    "created": True,
-                }
-            )
-            self._ctx.services.spawn(
-                self._model.maybe_continue_response(
-                    expected_epoch=session.epoch,
-                    expected_model_turn_id=session.turn_id,
-                ),
-                name="duplex-continue",
-            )
+            await self._on_function_call_output(item, event_id=event.get("realtime_event_id"))
             return
         item_payload = item if isinstance(item, dict) else None
         raw_parts = item_payload.get("content", []) if item_payload is not None else []
@@ -380,3 +355,109 @@ class SessionControl:
                 "created": message is not None,
             }
         )
+
+    async def _on_function_call_output(self, item: Mapping[str, object], *, event_id: object) -> None:
+        """Admit one client tool result, or answer why it cannot be admitted.
+
+        The session's tool-call ledger is the admission authority (see
+        ``session/tool_calls.py``): a result is admitted only for a call this
+        session exposed, that is still pending, and whose origin epoch the
+        session has not cancelled since. Eligibility is checked before the
+        append tail and again after it, and the plugin's candidate runtime
+        config is built before anything is committed -- everything that can fail
+        happens while the call is still pending and answerable, and the commit
+        itself performs no ``await``.
+        """
+        session = self._ctx.session
+        ledger = self._ctx.tool_calls
+        call_id = item.get("call_id")
+        acceptance = ledger.begin_accept(call_id)
+        if isinstance(acceptance, ToolCallRejection):
+            self._reject_function_call_output(acceptance, call_id, event_id=event_id)
+            return
+        if not await self._wait_for_append_tail():
+            # Nothing was applied and the call is still pending: the client may
+            # send the same result again once the append path has recovered.
+            self._out.emit_error(
+                "commit_aborted",
+                "the function_call_output was not applied because the preceding append failed",
+                event_id=event_id,
+            )
+            return
+        epoch = session.epoch
+        rejection = ledger.revalidate(acceptance, epoch=epoch)
+        if rejection is not None:
+            self._reject_function_call_output(rejection, call_id, event_id=event_id)
+            return
+        try:
+            candidate_runtime_config = self._ctx.plugin.runtime_config_for_function_output(
+                session.config,
+                dict(session.runtime_config),
+                item,
+            )
+        except DuplexRuntimeConfigError as exc:
+            # The plugin refused the result; the call stays pending, so a
+            # corrected result for the same call is still admissible.
+            self._out.emit_error(exc.code, str(exc), event_id=event_id)
+            return
+        # Rendering the candidate is synchronous but not instant (a tool result
+        # is tokenized here), so the deadline is rechecked *after* it and
+        # immediately before the commit: a result that missed its deadline while
+        # the plugin was rendering it is a timeout, and neither the candidate
+        # nor the continuation may be installed for it.
+        expiry = ledger.revalidate(acceptance, epoch=epoch)
+        if expiry is not None:
+            self._reject_function_call_output(expiry, call_id, event_id=event_id)
+            return
+        # -- commit: no ``await`` past this point --
+        ledger.commit_accept(acceptance, epoch=epoch)
+        # Read the continuation target inside the await-free commit, so it is
+        # the turn the session is on when the result is applied -- not the turn
+        # the call was emitted in. A model turn can complete while the client is
+        # answering, and the ledger's job is eligibility (origin epoch plus
+        # settlement), not liveness: the origin turn stays on the record as
+        # identity, the response has to continue the *current* turn.
+        current_model_turn_id = session.turn_id
+        if candidate_runtime_config is not None:
+            session.replace_runtime_config(candidate_runtime_config)
+        self._out.emit(
+            {
+                "type": "conversation.item.created",
+                "session_id": session.session_id,
+                "item": dict(item),
+                "created": True,
+            }
+        )
+        self._ctx.services.spawn(
+            self._model.maybe_continue_response(
+                expected_epoch=epoch,
+                expected_model_turn_id=current_model_turn_id,
+            ),
+            name="duplex-continue",
+        )
+
+    def _reject_function_call_output(self, reason: ToolCallRejection, call_id: object, *, event_id: object) -> None:
+        """Report a refused result with the wire shape the public contract kept.
+
+        Same code, ``event_id`` correlation and ``item.call_id`` /
+        ``item.output`` param as the projection used to send; only the message
+        is per-cause, because the causes are no longer one bucket.
+        """
+        settled = self._ctx.tool_calls.record(call_id)
+        state = settled.state if settled is not None else None
+        if reason is ToolCallRejection.UNKNOWN:
+            message = "function_call_output requires the call_id of a completed function call"
+            param = "item.call_id"
+        elif reason is ToolCallRejection.EXPIRED or state is ToolCallState.TIMED_OUT:
+            # ``EXPIRED`` is "the deadline had already passed when this arrived";
+            # a timed-out record is the same fact one step later (the timer
+            # settled it first). Both answer as a timeout, not as a cancellation.
+            message = f"function_call_output arrived after tool_result_timeout_s for call_id {call_id}"
+            param = "item.call_id"
+        elif state is ToolCallState.ACCEPTED:
+            message = f"function_call_output already exists for call_id {call_id}"
+            param = "item.output"
+        else:
+            message = f"function_call_output for call_id {call_id} belongs to a cancelled call and will not be applied"
+            param = "item.output"
+        self._out.emit_events([error_event("invalid_function_call_output", message, event_id=event_id, param=param)])

@@ -332,6 +332,31 @@ for queue updates and the final validity check before delivery.
   yielding. An append task already past its last check is harmless: its stage
   request is bound to the old epoch's request id, which the abort covers, and
   the base never emits session-owned outputs to a client.
+- **Tool calls settle once, and the epoch settles them.** A function call the
+  runtime exposes to the client (`response.function_call_arguments.done`) is
+  recorded in a session-owned ledger before it is emitted, and its
+  `function_call_output` is admitted only against that record:
+  `pending -> accepted | timed_out | cancelled`, one transition, no rebinding
+  of a call id, and terminal records kept as tombstones until the session
+  closes. Conversation history is not admission authority -- it is history-wide
+  and epoch-blind, so a result arriving after a barge-in could otherwise be
+  admitted against a call the session had already moved past. The epoch
+  consequences hang off the single epoch-advance path: pending calls from older
+  epochs are cancelled, and a result the model accepted but never consumed is
+  retired from the runtime so the new epoch cannot speak it. A retired or
+  already-consumed generation stays *named* in the worker-facing runtime config
+  (model-owned state is per resumable stage request, and a cancel moves the
+  session to a different one), so the next request starts above what the
+  previous one took instead of re-speaking it or rejecting the next result as
+  missing; a generation that only *looks* missing is still refused by the
+  worker. Eligibility is the
+  origin epoch plus the settlement, never the current turn: a model turn
+  completing while the client answers does not invalidate the result, and the
+  continuation it triggers targets the turn that is current at admission.
+  An optional deadline (`extra_body.tool_result_timeout_s`, off by default)
+  times a pending call out; its timer callback only enqueues the call identity
+  onto the session's mailbox, so the deadline decision is serialized with every
+  other command instead of running inside an `asyncio` timer callback.
 - **Ordered event stream.** Because the epoch bump and every emission happen
   on one loop in program order, nothing can be emitted for an old epoch after
   its terminal event; `runner.emit()` still drops a terminal carrying a stale
