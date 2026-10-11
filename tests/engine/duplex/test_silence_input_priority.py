@@ -51,25 +51,25 @@ async def test_received_audio_prevents_silence_before_pcm_buffering(monkeypatch,
         if waiting_at == "decode":
             original = h.runner.offload
 
-            async def gated(fn, *args, **kwargs):
+            async def gated_decode(fn, *args, **kwargs):
                 if fn is runner_module.convert_input_audio_with_rate:
                     entered.set()
                     await release.wait()
                 return await original(fn, *args, **kwargs)
 
-            monkeypatch.setattr(h.runner, "offload", gated)
+            monkeypatch.setattr(h.runner, "offload", gated_decode)
             h.submit(append_audio(samples=1280))
         else:
             original = h.runner._handle_item
             blocker = commands.UpdateSession(patch={})
 
-            async def gated(item):
+            async def gated_mailbox(item):
                 if item is blocker:
                     entered.set()
                     await release.wait()
                 return await original(item)
 
-            monkeypatch.setattr(h.runner, "_handle_item", gated)
+            monkeypatch.setattr(h.runner, "_handle_item", gated_mailbox)
             h.submit(blocker)
             h.submit(append_audio(samples=1280))
         await asyncio.wait_for(entered.wait(), timeout=2)
