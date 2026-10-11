@@ -253,13 +253,6 @@ class DuplexPlaybackView:
         }
 
 
-@dataclass
-class DuplexAudioChunk:
-    data: str
-    format: str = "wav"
-    sample_rate_hz: int | None = None
-
-
 #: ``extra_body`` key of the optional session-wide tool-result deadline. It sits
 #: in ``extra_body`` rather than in a typed field because a session's
 #: server-side behaviour switches (``auto_response``, ``realtime_tools``,
@@ -904,7 +897,6 @@ def input_audio_transcription_config(session_payload: Mapping[str, object]) -> d
 
 __all__ = [
     "DuplexAssistantAudioTextMark",
-    "DuplexAudioChunk",
     "DuplexCapabilities",
     "DuplexCommittedInput",
     "DuplexConfigError",
