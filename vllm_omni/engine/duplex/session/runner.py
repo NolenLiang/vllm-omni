@@ -183,6 +183,10 @@ class DuplexSessionRunner:
         self.model_state: DuplexModelSessionState = session.model_state
         self.tasks = DuplexSessionTasks()
         self._mailbox: asyncio.Queue[DuplexCommand | StageOutput | _Internal] = asyncio.Queue()
+        # Audio awaiting mailbox dispatch or offloaded decoding is real input
+        # too, even before it reaches the PCM buffer. Continuations must not
+        # insert a synthetic frame ahead of that already-received audio.
+        self._pending_input_appends = 0
         self._worker: asyncio.Task[None] | None = None
         self._worker_stopped = False
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -248,6 +252,8 @@ class DuplexSessionRunner:
         self.emit({"type": "session.created", "session": session.as_public_dict()})
 
     def submit(self, command: DuplexCommand) -> None:
+        if isinstance(command, AppendAudio):
+            self._pending_input_appends += 1
         self._mailbox.put_nowait(command)
 
     def on_stage_output(
@@ -475,6 +481,9 @@ class DuplexSessionRunner:
             except Exception as exc:
                 logger.exception("Duplex session %s failed handling %r: %s", self.session.session_id, item, exc)
                 self._emit_error("internal_error", str(exc))
+            finally:
+                if isinstance(item, AppendAudio):
+                    self._pending_input_appends -= 1
 
     async def _stop_worker(self) -> None:
         worker = self._worker
@@ -1144,7 +1153,11 @@ class DuplexSessionRunner:
 
     def _real_input_waiting(self) -> bool:
         self._clear_completed_pending_silence()
-        return self.model_state.audio_buffer.has_pending() or self.model_state.audio_buffer.has_reserved()
+        return (
+            self._pending_input_appends > 0
+            or self.model_state.audio_buffer.has_pending()
+            or self.model_state.audio_buffer.has_reserved()
+        )
 
     async def _start_append(
         self,
