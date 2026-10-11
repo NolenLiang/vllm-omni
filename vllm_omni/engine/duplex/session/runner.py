@@ -1403,7 +1403,7 @@ class DuplexSessionRunner:
             "output_audio_buffer_clear"
             if event_type == "output_audio_buffer.clear"
             else "client_cancelled"
-            if event_type == "response.cancel"
+            if event_type in {"response.cancel", "input.cancel"}
             else "barge_in"
         )
         cancelled_fence = session.fence
@@ -1521,7 +1521,23 @@ class DuplexSessionRunner:
             self.tasks.active_response_task = None
             return
         if not cancelled:
-            self._cancel_pending_input(reason="barge_in")
+            self._cancel_pending_input(reason=cancel_reason)
+        elif event_type == "input.cancel":
+            # The branch above owns the queued-input acknowledge together with
+            # its single epoch advance. When instead an active response or a
+            # data-plane stream already tore the turn down and advanced the
+            # epoch, an explicit input.cancel still owes exactly one
+            # acknowledgement -- emitted here at the current epoch, with no
+            # second cancellation and no second epoch advance. Acoustic barge_in
+            # never reaches this branch, so it gains no input-clear event.
+            self.emit(
+                {
+                    "type": "input.cancelled",
+                    "session_id": session.session_id,
+                    "reason": cancel_reason,
+                    "epoch": session.epoch,
+                }
+            )
         if not await self.model.signal_cancel_fence(cancelled_fence):
             return
         self.tasks.active_response_task = None
