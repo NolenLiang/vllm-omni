@@ -63,6 +63,46 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_INVALID_FUNCTION_CALL = object()
+
+
+def _coerce_function_call(raw: object) -> dict[str, str] | None:
+    if not isinstance(raw, Mapping):
+        return None
+    call_id = raw.get("call_id")
+    name = raw.get("name")
+    arguments = raw.get("arguments", "")
+    if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+        return None
+    if not isinstance(arguments, str):
+        try:
+            arguments = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return None
+    return {"call_id": call_id, "name": name, "arguments": arguments}
+
+
+def _recognized_function_call(plugin: object, model_result: Mapping[str, object]) -> dict[str, str] | object | None:
+    """Plugin parse first; otherwise the legacy ``function_call`` flag.
+
+    A plugin dict that is not a call is ``_INVALID_FUNCTION_CALL``. An invalid
+    legacy call returns None so the flagged-call handler can reject it before
+    registration or publication.
+    """
+    parsed = plugin.parse_function_call(model_result)  # type: ignore[attr-defined]
+    if parsed is not None:
+        call = _coerce_function_call(parsed)
+        return call if call is not None else _INVALID_FUNCTION_CALL
+    if model_result.get("function_call") is not True:
+        return None
+    return _coerce_function_call(
+        {
+            "call_id": model_result.get("call_id"),
+            "name": model_result.get("name"),
+            "arguments": model_result.get("arguments", ""),
+        }
+    )
+
 
 class SilenceContinuationScheduler(Protocol):
     """Runs one continuation append as a tracked task (see ``_schedule_silence_continuation``)."""
@@ -300,11 +340,15 @@ class ModelChannel:
             prompt_payload: dict[str, object] = (
                 {str(key): value for key, value in payload.items()} if isinstance(payload, Mapping) else {}
             )
+            prompt_config = {**request_context.session_config, "conversation": list(session.history)}
+            tool_history_len = request_context.runtime_config.get("qwen_tool_history_len")
+            if isinstance(tool_history_len, int):
+                prompt_config["qwen_tool_history_len"] = tool_history_len
             append_plan = await self._ctx.plugin.prepare_append_plan(
                 request_id=request_id,
                 fence=fence,
                 session_config=self._ctx.plugin.prepare_prompt_config(
-                    {**request_context.session_config, "conversation": list(session.history)},
+                    prompt_config,
                     state=self._ctx.model_state,
                     payload=prompt_payload,
                 ),
@@ -897,6 +941,20 @@ class ModelChannel:
             return close_reason, emitted_response
         if isinstance(model_result.get("error_code"), str):
             self._fail_response_from_model_error(model_result)
+            return close_reason, True
+        try:
+            function_call = _recognized_function_call(self._ctx.plugin, model_result)
+        except DuplexRuntimeConfigError as exc:
+            self._out.emit_error(exc.code, str(exc))
+            return close_reason, True
+        if function_call is _INVALID_FUNCTION_CALL:
+            self._out.emit_error(
+                "invalid_function_call",
+                "A recognized function call requires call_id and name",
+            )
+            return close_reason, True
+        if isinstance(function_call, dict):
+            await self._expose_function_call(function_call)
             return close_reason, True
         if model_result.get("function_call") is True:
             await self._expose_function_call(model_result)

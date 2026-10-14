@@ -366,7 +366,7 @@ def test_draining_empty_eos_completes_owning_response_before_shortcut() -> None:
     channel = ModelChannel(
         SimpleNamespace(
             session=session,
-            plugin=SimpleNamespace(data_plane=_Plane()),
+            plugin=SimpleNamespace(data_plane=_Plane(), parse_function_call=lambda _: None),
             stage_port=port,
             model_state=SimpleNamespace(clear_continuation=lambda: None),
             services=SimpleNamespace(spawn=lambda *_a, **_k: None),
@@ -458,7 +458,7 @@ def test_draining_completion_drops_finished_response_books_only() -> None:
     channel = ModelChannel(
         SimpleNamespace(
             session=session,
-            plugin=SimpleNamespace(data_plane=_Plane()),
+            plugin=SimpleNamespace(data_plane=_Plane(), parse_function_call=lambda _: None),
             stage_port=_Port(),
             model_state=SimpleNamespace(clear_continuation=lambda: None),
             services=SimpleNamespace(spawn=lambda *_a, **_k: None),
@@ -617,7 +617,7 @@ def test_silent_listen_with_continuation_releases_ephemeral_request() -> None:
     channel = ModelChannel(
         SimpleNamespace(
             session=session,
-            plugin=SimpleNamespace(data_plane=_Plane()),
+            plugin=SimpleNamespace(data_plane=_Plane(), parse_function_call=lambda _: None),
             stage_port=port,
             model_state=SimpleNamespace(
                 continuation_owner_id=None, continuation_units=0, clear_continuation=lambda: None
@@ -698,7 +698,7 @@ def test_silent_listen_aborts_data_plane_request_with_full_id() -> None:
     channel = ModelChannel(
         SimpleNamespace(
             session=session,
-            plugin=SimpleNamespace(data_plane=_Plane()),
+            plugin=SimpleNamespace(data_plane=_Plane(), parse_function_call=lambda _: None),
             stage_port=_Port(),
             model_state=SimpleNamespace(
                 continuation_owner_id=None, continuation_units=0, clear_continuation=lambda: None

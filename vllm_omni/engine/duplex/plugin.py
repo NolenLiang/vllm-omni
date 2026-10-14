@@ -512,6 +512,20 @@ class DuplexModelPlugin(ABC):
             modalities=modalities,
         )
 
+    def parse_function_call(self, model_result: Mapping[str, object]) -> dict[str, str] | None:
+        """Recognize one function call in this model's output, or None.
+
+        The plugin owns recognition. A plugin that does not emit tool calls
+        keeps this default. A recognized call is ``{"call_id", "name",
+        "arguments"}``. Feeding an accepted result back is
+        ``runtime_config_for_function_output``.
+
+        A recognized malformed call may raise ``DuplexRuntimeConfigError``;
+        the output path reports that error without registering or exposing it.
+        """
+        del model_result
+        return None
+
     def runtime_config_for_function_output(
         self,
         config: DuplexSessionConfig,

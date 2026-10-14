@@ -410,6 +410,17 @@ class SessionControl:
                 deepcopy(dict(session.runtime_config)),
                 deepcopy(prepared_item),
             )
+            # Retain #8493's existing history anchor in this combination probe.
+            # #8758 still supplies trusted ledger context and owns admission.
+            if isinstance(candidate_runtime_config, dict):
+                pending_tools = candidate_runtime_config.get("qwen_tool_messages")
+                if (
+                    isinstance(pending_tools, list)
+                    and pending_tools
+                    and not isinstance(candidate_runtime_config.get("qwen_tool_history_len"), int)
+                ):
+                    candidate_runtime_config = dict(candidate_runtime_config)
+                    candidate_runtime_config["qwen_tool_history_len"] = len(session.history)
             # Detach returned plugin-owned objects before terminal cleanup can
             # mutate or release them, while refusal is still retryable.
             if candidate_runtime_config is not None:
