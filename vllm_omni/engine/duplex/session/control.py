@@ -464,13 +464,17 @@ class SessionControl:
                 "created": True,
             }
         )
-        self._ctx.services.spawn(
-            self._model.maybe_continue_response(
-                expected_epoch=epoch,
-                expected_model_turn_id=current_model_turn_id,
-            ),
-            name="duplex-continue",
-        )
+        # Tool-result admission does not finish an in-flight committed turn.
+        # Its real terminal output owns response closure; the non-resumable
+        # branch of maybe_continue_response is only for listen/final decisions.
+        if session.capabilities.supports_core_resumable_request:
+            self._ctx.services.spawn(
+                self._model.maybe_continue_response(
+                    expected_epoch=epoch,
+                    expected_model_turn_id=current_model_turn_id,
+                ),
+                name="duplex-continue",
+            )
 
     def _reject_function_call_output(self, reason: ToolCallRejection, call_id: object, *, event_id: object) -> None:
         """Report a refused result with the wire shape the public contract kept.
