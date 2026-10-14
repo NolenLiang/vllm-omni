@@ -68,8 +68,8 @@ class DuplexRunState:
 class RunnerServices(Protocol):
     """The only things a component may ask the runner for.
 
-    Deliberately two methods. A component that needs more than task scheduling
-    from the runner is reaching for orchestration that belongs in the runner.
+    Scheduling and terminal bookkeeping stay in the runner; components do not
+    acquire their own delivery queue or call-lifecycle authority.
     """
 
     def spawn(self, coro: Awaitable[None], *, name: str) -> None:
@@ -78,6 +78,10 @@ class RunnerServices(Protocol):
 
     async def offload(self, fn: Callable[..., _OffloadT], *args: object, **kwargs: object) -> _OffloadT:
         """Run a blocking call off the orchestrator loop."""
+        ...
+
+    def finalize_tool_call(self, call_id: str) -> bool:
+        """Finalize terminal plugin bookkeeping before acknowledging a result."""
         ...
 
 

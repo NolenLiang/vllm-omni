@@ -24,6 +24,7 @@ import asyncio
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, TypeVar
 
@@ -100,7 +101,7 @@ from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
-from vllm_omni.engine.duplex.session.tool_calls import LoopTimerScheduler, ToolCallLedger
+from vllm_omni.engine.duplex.session.tool_calls import LoopTimerScheduler, ToolCallLedger, ToolCallSettlement
 from vllm_omni.engine.duplex.turn_detection import (
     TurnDetectionResult,
 )
@@ -193,6 +194,10 @@ class DuplexSessionRunner:
         self._background_tasks: set[asyncio.Task[None]] = set()
         #: Flags more than one component reads and writes (see session_context).
         self.run = DuplexRunState()
+        # Delivery fences for immutable decisions, not another admission book.
+        # IDs cannot be rebound and their count is bounded by the ledger budget.
+        self._finalized_tool_calls: set[str] = set()
+        self._applied_tool_call_settlements: set[str] = set()
         #: Function calls this session exposed and their one terminal state each.
         #: Created before the context because the components read it through the
         #: context; the timer seam is attached in ``start`` (it needs the loop).
@@ -201,6 +206,7 @@ class DuplexSessionRunner:
             clock=session._clock,
             timeout_s=resolve_tool_result_timeout_s(session.config.extra_body),
             on_expire=self._enqueue_tool_call_expiry,
+            on_settle=self._enqueue_tool_call_settlement,
         )
         self.ctx = DuplexSessionContext(
             session=session,
@@ -455,7 +461,7 @@ class DuplexSessionRunner:
         await self._stop_worker()
 
     async def shutdown(self) -> None:
-        self.run.closing = True
+        self._begin_close("shutdown")
         self.run.closed_emitted = True
         await self.tasks.cancel_append_tasks()
         self.model.cancel_data_plane_stream()
@@ -463,7 +469,6 @@ class DuplexSessionRunner:
         if active_response_task is not None and not active_response_task.done():
             active_response_task.cancel()
             await asyncio.gather(active_response_task, return_exceptions=True)
-        self.tool_calls.close()
         self.session.close()
         await self._stop_worker()
 
@@ -555,6 +560,9 @@ class DuplexSessionRunner:
             return
         if item.kind == "tool_call_expiry":
             self._on_tool_call_expiry(item.payload)
+            return
+        if item.kind == "tool_call_settlement":
+            await self._on_tool_call_settlement(item.payload)
             return
         logger.warning("Unknown duplex runner internal item: %s", item.kind)
 
@@ -784,6 +792,67 @@ class DuplexSessionRunner:
         if candidate is not None:
             session.replace_runtime_config(candidate)
 
+    def _enqueue_tool_call_settlement(self, settlement: ToolCallSettlement) -> None:
+        """Keep every settlement path on one ordered model-effect boundary."""
+        self._mailbox.put_nowait(_Internal("tool_call_settlement", {"settlement": settlement}))
+
+    def finalize_tool_call(self, call_id: str) -> bool:
+        """Complete terminal bookkeeping before result install/ack/continuation."""
+        if self.run.closing or self.session.state != DuplexSessionState.OPEN:
+            return False
+        call = self.tool_calls.record(call_id)
+        if call is None or not call.is_terminal or call.settled_epoch is None:
+            return False
+        return self._finalize_tool_call(ToolCallSettlement(call.origin, call.state, call.settled_epoch))
+
+    def _finalize_tool_call(self, settlement: ToolCallSettlement) -> bool:
+        call_id = settlement.origin.call_id
+        if call_id in self._finalized_tool_calls:
+            return True
+        self._finalized_tool_calls.add(call_id)
+        try:
+            self.plugin.on_tool_call_settled(settlement)
+        except Exception as exc:
+            logger.exception("Failed to finalize tool-call bookkeeping: %s", exc)
+            self._emit_error("tool_call_settlement_failed", "the session could not finalize a tool-call decision")
+            self._begin_close("tool_call_settlement_failed")
+            self.manager.close_from_runner(self, "tool_call_settlement_failed")
+            return False
+        return True
+
+    async def _on_tool_call_settlement(self, payload: dict[str, object]) -> None:
+        settlement = payload.get("settlement")
+        if not isinstance(settlement, ToolCallSettlement):
+            return
+        session = self.session
+        if self.run.closing or session.state != DuplexSessionState.OPEN:
+            return
+        call = self.tool_calls.record(settlement.origin.call_id)
+        if call is None or call.origin != settlement.origin or call.state != settlement.state:
+            return
+        if not self._finalize_tool_call(settlement):
+            return
+        call_id = settlement.origin.call_id
+        if call_id in self._applied_tool_call_settlements:
+            return
+        self._applied_tool_call_settlements.add(call_id)
+        try:
+            if settlement.settled_epoch != session.epoch:
+                # Finalize old metadata, but never change the new epoch's input.
+                return
+            candidate = self.plugin.runtime_config_for_tool_call_settlement(
+                session.config, deepcopy(dict(session.runtime_config)), settlement
+            )
+            if candidate is not None:
+                session.replace_runtime_config(candidate)
+        except Exception as exc:
+            logger.exception("Failed to apply tool-call settlement: %s", exc)
+            self._emit_error(
+                "tool_call_settlement_failed",
+                "the session could not apply a tool-call terminal decision",
+            )
+            await self._close_from_runtime("tool_call_settlement_failed")
+
     def _enqueue_tool_call_expiry(self, call_id: str) -> None:
         """Timer callback: hand the identity back to the mailbox, decide nothing.
 
@@ -813,6 +882,7 @@ class DuplexSessionRunner:
     # ------------------------------------------------------------------ #
 
     def _begin_close(self, reason: str) -> None:
+        first_close = not self.run.closing
         self.run.closing = True
         self.run.close_reason = self.run.close_reason or reason
         self.session.mark_closing()
@@ -821,7 +891,15 @@ class DuplexSessionRunner:
         # output-backpressure close. Releasing the call ledger here (rather than
         # at each of those) is what guarantees no deadline timer outlives the
         # session it would settle a call for.
+        if first_close:
+            try:
+                self.plugin.on_tool_calls_closed(self.tool_calls.origins())
+            except Exception:
+                # Closing remains irreversible even if disposal itself fails.
+                logger.exception("Failed to dispose tool-call metadata during close")
         self.tool_calls.close()
+        self._finalized_tool_calls.clear()
+        self._applied_tool_call_settlements.clear()
 
     def _session_auto_responds(self) -> bool:
         return self.out.auto_responds()

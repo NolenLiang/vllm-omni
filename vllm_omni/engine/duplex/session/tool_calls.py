@@ -41,6 +41,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
+from typing import TypeAlias
 
 from vllm_omni.engine.duplex.session.timers import (
     LoopTimerScheduler,
@@ -58,6 +59,7 @@ __all__ = [
     "ToolCallOrigin",
     "ToolCallRegistrationError",
     "ToolCallRejection",
+    "ToolCallSettlement",
     "ToolCallState",
     "ToolCallTimer",
 ]
@@ -100,6 +102,21 @@ class ToolCallOrigin:
     turn_id: int
     response_id: str | None
     item_id: str
+    name: str | None = None
+    arguments: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ToolCallSettlement:
+    """One new terminal decision, independent of model delivery or consumption.
+
+    The owner's notification callback only queues this immutable fact. It must
+    not perform model or wire effects from inside the ledger's mutation.
+    """
+
+    origin: ToolCallOrigin
+    state: ToolCallState
+    settled_epoch: int
 
 
 @dataclass(slots=True)
@@ -140,7 +157,7 @@ class ToolCallAcceptance:
 
 
 #: The ledger's own name for the shared handle: an armed expiry it can cancel.
-ToolCallTimer = ScheduledTimer
+ToolCallTimer: TypeAlias = ScheduledTimer
 
 
 class ToolCallRegistrationError(RuntimeError):
@@ -166,6 +183,7 @@ class ToolCallLedger:
         clock: Callable[[], float],
         timeout_s: float | None = None,
         on_expire: Callable[[str], None] | None = None,
+        on_settle: Callable[[ToolCallSettlement], None] | None = None,
     ) -> None:
         # A record budget is a count, so only an integer will do: ``True`` would
         # become a limit of one and ``0.5`` a silently truncated zero.
@@ -180,6 +198,7 @@ class ToolCallLedger:
         #: Called by the timer callback with the call id only -- enqueueing, never
         #: deciding. The decision is the mailbox handler's (``expire``).
         self._on_expire = on_expire
+        self._on_settle = on_settle
         self._scheduler: TimerScheduler | None = None
         self._closed = False
 
@@ -201,6 +220,10 @@ class ToolCallLedger:
 
     def __contains__(self, call_id: object) -> bool:
         return isinstance(call_id, str) and call_id in self._calls
+
+    def origins(self) -> tuple[ToolCallOrigin, ...]:
+        """Immutable identities for final plugin disposal when the session closes."""
+        return tuple(call.origin for call in self._calls.values())
 
     # -- exposure ------------------------------------------------------- #
 
@@ -239,6 +262,8 @@ class ToolCallLedger:
         scheduler = self._scheduler
         if call.deadline is None or scheduler is None:
             return
+        if call.timer is not None:
+            call.timer.cancel()
         call_id = call.origin.call_id
         call.timer = scheduler.call_later(max(0.0, call.deadline - now), lambda: self._fire(call_id))
 
@@ -309,11 +334,19 @@ class ToolCallLedger:
         return None
 
     def commit_accept(self, acceptance: ToolCallAcceptance, *, epoch: int | None = None) -> bool:
-        """Settle a revalidated call as accepted (await-free; caller owns effects)."""
+        """Recheck and settle atomically; the caller must respect a refusal.
+
+        Conversion can cross a deadline even without yielding to the loop.
+        Keep the final eligibility check inside the settlement operation so a
+        caller cannot install a candidate using an earlier successful check.
+        """
+        current_epoch = acceptance.epoch if epoch is None else epoch
+        if self.revalidate(acceptance, epoch=current_epoch) is not None:
+            return False
         call = self._calls.get(acceptance.call_id)
         if call is None or not call.is_pending:
             return False
-        self._settle(call, ToolCallState.ACCEPTED, epoch=epoch)
+        self._settle(call, ToolCallState.ACCEPTED, epoch=current_epoch)
         return True
 
     def expire(self, call_id: object, *, now: float | None = None) -> bool:
@@ -333,6 +366,9 @@ class ToolCallLedger:
             return False
         instant = self._clock() if now is None else now
         if instant < call.deadline:
+            # Event loops may deliver a timer slightly early. That message
+            # cannot consume the only wakeup for an otherwise pending call.
+            self._arm(call, now=instant)
             return False
         self._settle(call, ToolCallState.TIMED_OUT, epoch=None)
         return True
@@ -354,10 +390,12 @@ class ToolCallLedger:
 
     def _settle(self, call: ToolCall, state: ToolCallState, *, epoch: int | None) -> None:
         call.state = state
-        call.settled_epoch = epoch
+        call.settled_epoch = call.origin.epoch if epoch is None else epoch
         timer, call.timer = call.timer, None
         if timer is not None:
             timer.cancel()
+        if self._on_settle is not None:
+            self._on_settle(ToolCallSettlement(call.origin, state, call.settled_epoch))
 
     def close(self) -> None:
         """Drop every record and timer: the session is gone, nothing can settle.

@@ -364,9 +364,10 @@ class SessionControl:
         session exposed, that is still pending, and whose origin epoch the
         session has not cancelled since. Eligibility is checked before the
         append tail and again after it, and the plugin's candidate runtime
-        config is built before anything is committed -- everything that can fail
-        happens while the call is still pending and answerable, and the commit
-        itself performs no ``await``.
+        config is built before anything is committed. Retryable preparation
+        errors leave the call pending. Terminal plugin bookkeeping finishes
+        before the success acknowledgement; failure there closes the session
+        rather than reopening an already accepted call. Commit has no ``await``.
         """
         session = self._ctx.session
         ledger = self._ctx.tool_calls
@@ -392,7 +393,7 @@ class SessionControl:
         try:
             candidate_runtime_config = self._ctx.plugin.runtime_config_for_function_output(
                 session.config,
-                dict(session.runtime_config),
+                deepcopy(dict(session.runtime_config)),
                 item,
             )
         except DuplexRuntimeConfigError as exc:
@@ -405,12 +406,19 @@ class SessionControl:
         # immediately before the commit: a result that missed its deadline while
         # the plugin was rendering it is a timeout, and neither the candidate
         # nor the continuation may be installed for it.
+        epoch = session.epoch
         expiry = ledger.revalidate(acceptance, epoch=epoch)
         if expiry is not None:
             self._reject_function_call_output(expiry, call_id, event_id=event_id)
             return
         # -- commit: no ``await`` past this point --
-        ledger.commit_accept(acceptance, epoch=epoch)
+        if not ledger.commit_accept(acceptance, epoch=epoch):
+            self._reject_function_call_output(ToolCallRejection.NOT_PENDING, call_id, event_id=event_id)
+            return
+        if not self._ctx.services.finalize_tool_call(acceptance.call_id):
+            # Acceptance is terminal. A failed finalize closes the session and
+            # must not acknowledge or continue an unusable prepared result.
+            return
         # Read the continuation target inside the await-free commit, so it is
         # the turn the session is on when the result is applied -- not the turn
         # the call was emitted in. A model turn can complete while the client is

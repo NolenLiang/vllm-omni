@@ -32,6 +32,8 @@ from vllm_omni.engine.duplex.contracts import (
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
+    from vllm_omni.engine.duplex.session.tool_calls import ToolCallOrigin, ToolCallSettlement
+
 
 class DuplexRuntimeConfigError(ValueError):
     """A model plugin rejected client-visible runtime configuration."""
@@ -510,15 +512,62 @@ class DuplexModelPlugin(ABC):
             modalities=modalities,
         )
 
-    # Optional hook: build the runtime config patch for a function-call output
-    # item. Plugins without tools keep the default (no change).
     def runtime_config_for_function_output(
         self,
         config: DuplexSessionConfig,
         current: Mapping[str, object],
         item: Mapping[str, object],
     ) -> dict[str, object] | None:
+        """Prepare a result candidate without committing plugin bookkeeping.
+
+        The session revalidates epoch and deadline after conversion. Do not
+        consume a call's cached metadata here: a candidate can still be refused.
+        Terminal bookkeeping belongs in ``on_tool_call_settled``.
+        Plugins without tools keep the default (no change).
+        """
         del config, current, item
+        return None
+
+    def on_tool_call_settled(self, settlement: ToolCallSettlement) -> None:
+        """Finalize only the named call's cached metadata after its decision.
+
+        A terminal notification may outlive its origin epoch. This cleanup must
+        not change model input, runtime config or continuation state. The
+        separate recovery hook is fenced against superseded epochs.
+        """
+        del settlement
+
+    def on_tool_calls_closed(self, origins: tuple[ToolCallOrigin, ...]) -> None:
+        """Dispose cached metadata for this session's calls, including pending.
+
+        Close can overtake queued terminal notifications. Cleanup must be
+        idempotent because some calls have already been finalized individually.
+        This does not perform model recovery or change another session's state.
+        """
+        del origins
+
+    def runtime_config_for_tool_call_settlement(
+        self,
+        config: DuplexSessionConfig,
+        current: Mapping[str, object],
+        settlement: ToolCallSettlement,
+    ) -> dict[str, object] | None:
+        """Handle one new terminal decision on the session mailbox.
+
+        This is called for a terminal decision still in the current epoch,
+        never during speculative result conversion. Cached metadata cleanup
+        belongs in ``on_tool_call_settled`` and runs even if an epoch changed.
+        Plugins may prepare call-scoped model recovery here. Returning ``None``
+        requests no runtime-config change; it is
+        not an acknowledgement that the worker consumed anything. A timeout
+        must not reset the session or retire another call's queued result.
+
+        Raising closes the session: the owner cannot safely retry partial
+        model/bookkeeping effects. Closed or superseded decisions are skipped.
+        Accepted results must already be usable from their prepared candidate;
+        this deferred hook cannot perform work required before their wire ack.
+        """
+        del config, current, settlement
         return None
 
     def runtime_config_after_model_output(

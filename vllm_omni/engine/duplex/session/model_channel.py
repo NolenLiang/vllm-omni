@@ -821,6 +821,49 @@ class ModelChannel:
         await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
         return close_reason, emitted_response
 
+    async def _expose_function_call(self, function_call: Mapping[str, object]) -> None:
+        """Register a recognized plugin or data-plane call before publishing it.
+
+        Parsing stays in the model plugin. Both shared parsing and the legacy
+        data-plane path can use this admission boundary without a second book.
+        """
+        session = self._ctx.session
+        call_id, name = function_call.get("call_id"), function_call.get("name")
+        if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+            self._out.emit_error("invalid_function_call", "A recognized function call requires call_id and name")
+            return
+        arguments = function_call.get("arguments", "")
+        item_id = f"item_{uuid.uuid4().hex}"
+        response_id = f"resp_{uuid.uuid4().hex}"
+        try:
+            self._ctx.tool_calls.register(
+                ToolCallOrigin(
+                    call_id=call_id,
+                    epoch=session.epoch,
+                    turn_id=session.turn_id,
+                    response_id=response_id,
+                    item_id=item_id,
+                    name=name,
+                    arguments=arguments if isinstance(arguments, str) else None,
+                )
+            )
+        except ToolCallRegistrationError as exc:
+            self._out.emit_error(exc.code, str(exc))
+            await self._close_from_runtime("tool_call_lifecycle")
+            return
+        self._out.emit(
+            {
+                "type": "function_call.done",
+                "session_id": session.session_id,
+                "epoch": session.epoch,
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments,
+                "item_id": item_id,
+                "response_id": response_id,
+            }
+        )
+
     async def _send_one_model_output_event(
         self,
         model_result: dict[str, object],
@@ -849,40 +892,7 @@ class ModelChannel:
             self._fail_response_from_model_error(model_result)
             return close_reason, True
         if model_result.get("function_call") is True:
-            call_id = model_result.get("call_id")
-            name = model_result.get("name")
-            payload: dict[str, object] = {
-                "type": "function_call.done",
-                "session_id": session.session_id,
-                "epoch": session.epoch,
-                "call_id": call_id,
-                "name": name,
-                "arguments": model_result.get("arguments", ""),
-            }
-            if isinstance(call_id, str) and call_id and isinstance(name, str) and name:
-                # The call is registered before it is exposed, in the same
-                # synchronous step: the ledger is the only admission authority
-                # for the client's answer, so a call it does not hold could
-                # never be answered and must not be projected at all.
-                item_id = f"item_{uuid.uuid4().hex}"
-                call_response_id = f"resp_{uuid.uuid4().hex}"
-                try:
-                    self._ctx.tool_calls.register(
-                        ToolCallOrigin(
-                            call_id=call_id,
-                            epoch=session.epoch,
-                            turn_id=session.turn_id,
-                            response_id=call_response_id,
-                            item_id=item_id,
-                        )
-                    )
-                except ToolCallRegistrationError as exc:
-                    self._out.emit_error(exc.code, str(exc))
-                    await self._close_from_runtime("tool_call_lifecycle")
-                    return close_reason, True
-                payload["item_id"] = item_id
-                payload["response_id"] = call_response_id
-            self._out.emit(payload)
+            await self._expose_function_call(model_result)
             return close_reason, True
         if model_result.get("requires_stage_handoff") is True or model_result.get("requires_tts_stage") is True:
             # Reserve the protocol response only when Stage1 emits text/audio.
