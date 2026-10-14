@@ -396,10 +396,18 @@ class SessionControl:
                 deepcopy(dict(session.runtime_config)),
                 item,
             )
+            # Detach returned plugin-owned objects before terminal cleanup can
+            # mutate or release them, while refusal is still retryable.
+            if candidate_runtime_config is not None:
+                candidate_runtime_config = deepcopy(candidate_runtime_config)
         except DuplexRuntimeConfigError as exc:
             # The plugin refused the result; the call stays pending, so a
             # corrected result for the same call is still admissible.
             self._out.emit_error(exc.code, str(exc), event_id=event_id)
+            return
+        except Exception:
+            logger.exception("Failed to prepare function-call output")
+            self._out.emit_error("commit_aborted", "the function_call_output could not be prepared", event_id=event_id)
             return
         # Rendering the candidate is synchronous but not instant (a tool result
         # is tokenized here), so the deadline is rechecked *after* it and
@@ -413,6 +421,12 @@ class SessionControl:
             return
         # -- commit: no ``await`` past this point --
         if not ledger.commit_accept(acceptance, epoch=epoch):
+            call = ledger.record(acceptance.call_id)
+            if call is not None and call.is_pending:
+                self._out.emit_error(
+                    "commit_aborted", "the function_call_output could not be committed", event_id=event_id
+                )
+                return
             self._reject_function_call_output(ToolCallRejection.NOT_PENDING, call_id, event_id=event_id)
             return
         if not self._ctx.services.finalize_tool_call(acceptance.call_id):

@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import json
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
@@ -833,6 +834,12 @@ class ModelChannel:
             self._out.emit_error("invalid_function_call", "A recognized function call requires call_id and name")
             return
         arguments = function_call.get("arguments", "")
+        if not isinstance(arguments, str):
+            try:
+                arguments = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+            except (TypeError, ValueError):
+                self._out.emit_error("invalid_function_call", "Function call arguments must be JSON serializable")
+                return
         item_id = f"item_{uuid.uuid4().hex}"
         response_id = f"resp_{uuid.uuid4().hex}"
         try:
@@ -844,7 +851,7 @@ class ModelChannel:
                     response_id=response_id,
                     item_id=item_id,
                     name=name,
-                    arguments=arguments if isinstance(arguments, str) else None,
+                    arguments=arguments,
                 )
             )
         except ToolCallRegistrationError as exc:

@@ -10,6 +10,7 @@ packages. The recording stage port does not establish model-side recovery.
 from __future__ import annotations
 
 import asyncio
+import json
 from copy import deepcopy
 from dataclasses import FrozenInstanceError
 from typing import TYPE_CHECKING
@@ -205,7 +206,7 @@ def install_recorder(monkeypatch, h):
 
     # Absence on the baseline must produce a behavioral failure, not prevent
     # collection of the old-API deadline and timer regressions above.
-    monkeypatch.setattr(h.runner.plugin, "runtime_config_for_tool_call_settlement", record, raising=False)
+    monkeypatch.setattr(h.runner.plugin, "runtime_config_for_tool_call_timeout", record, raising=False)
     return observed
 
 
@@ -279,7 +280,7 @@ async def test_timeout_of_a_preserves_b_and_its_independent_timer(monkeypatch):
 
         assert error_codes(await answer(h, call_b)) == []
         assert record_b.state is ToolCallState.ACCEPTED
-        assert [entry[0].origin.call_id for entry in observed] == [call_a, call_b]
+        assert [entry[0].origin.call_id for entry in observed] == [call_a]
         assert generation(h) == 1 and len(batches(h)) == 1
         assert h.scheduler.pending_delays() == []
 
@@ -318,16 +319,20 @@ async def test_conversion_candidate_is_discarded_when_commit_returns_false(monke
             return candidate
 
         monkeypatch.setattr(h.runner.plugin, "runtime_config_for_function_output", convert)
+        real_commit = h.runner.tool_calls.commit_accept
         monkeypatch.setattr(h.runner.tool_calls, "commit_accept", lambda acceptance, *, epoch: False)
-        events = await answer(h, call_id)
+        events = await h.run(commands.CreateItem(item=output_item(call_id), event_id="commit-refused"))
 
         assert len(converted) == 1 and converted[0]["nvc_function_response_generation"] == 1
-        assert error_codes(events) == ["invalid_function_call_output"]
+        assert error_codes(events) == ["commit_aborted"]
+        assert errors(events)[0].related_event_id == "commit-refused"
         assert "conversation.item.created" not in types(events)
         assert h.session.runtime_config == runtime_before
         assert len(h.port.submissions) == submissions_before
         assert h.runner.tool_calls.record(call_id).state is ToolCallState.PENDING
         assert observed == []
+        monkeypatch.setattr(h.runner.tool_calls, "commit_accept", real_commit)
+        assert "conversation.item.created" in types(await answer(h, call_id))
 
 
 @pytest.mark.asyncio
@@ -362,9 +367,7 @@ async def test_settlement_queued_before_cancel_cannot_reconfigure_the_new_epoch(
         assert len(cleanups) == 1
         next_call = await prepare(h)
         assert error_codes(await answer(h, next_call)) == []
-        assert len(observed) == 1
-        assert observed[0][0].origin.call_id == next_call
-        assert observed[0][0].settled_epoch == h.session.epoch
+        assert observed == []
         assert [settlement.origin.call_id for settlement in cleanups] == [call_id, next_call]
 
 
@@ -380,7 +383,7 @@ async def test_settlement_hook_failure_closes_without_leaking_candidate_mutation
             current["settlement_probe"]["values"].append(2)
             raise RuntimeError("settlement adapter failed")
 
-        monkeypatch.setattr(h.runner.plugin, "runtime_config_for_tool_call_settlement", fail, raising=False)
+        monkeypatch.setattr(h.runner.plugin, "runtime_config_for_tool_call_timeout", fail, raising=False)
         h.clock.advance(TIMEOUT_S)
         h.scheduler.fire_all()
         events = await h.settle()
@@ -388,7 +391,8 @@ async def test_settlement_hook_failure_closes_without_leaking_candidate_mutation
         assert len(observed) == 1 and observed[0].origin.call_id == call_id
         assert error_codes(events) == ["tool_result_timeout", "tool_call_settlement_failed"]
         assert h.runner.closing is True
-        assert h.session.state is not DuplexSessionState.OPEN
+        assert h.session.state is DuplexSessionState.CLOSED
+        assert types(events).count("session.closed") == 1
         assert h.session.runtime_config["settlement_probe"] == {"values": [1]}
         assert len(h.runner.tool_calls) == 0
         assert h.scheduler.pending_delays() == []
@@ -440,7 +444,8 @@ async def test_cleanup_failure_closes_even_when_its_settlement_is_superseded(mon
         assert observed == []
         assert error_codes(events) == ["tool_result_timeout", "tool_call_settlement_failed"]
         assert h.runner.closing is True
-        assert h.session.state is not DuplexSessionState.OPEN
+        assert h.session.state is DuplexSessionState.CLOSED
+        assert types(events).count("session.closed") == 1
         assert len(h.runner.tool_calls) == 0
         assert h.scheduler.pending_delays() == []
         assert error_codes(await answer(h, call_id)) == ["unknown_session"]
@@ -560,6 +565,8 @@ async def test_accepted_cleanup_failure_installs_no_candidate_ack_or_continuatio
         assert h.session.runtime_config == runtime_before
         assert h.runner.closing is True
         assert call.state is ToolCallState.ACCEPTED  # failure never reopens admission
+        assert h.session.state is DuplexSessionState.CLOSED
+        assert types(events).count("session.closed") == 1
         assert disposed == [(call.origin,)]
         assert len(h.runner.tool_calls) == 0
         assert h.scheduler.pending_delays() == []
@@ -642,8 +649,9 @@ async def test_replayed_internal_settlements_repeat_neither_cleanup_nor_model_ef
         else:
             assert error_codes(await h.run(commands.CancelInput())) == []
 
-        assert len(cleanups) == len(observed) == 1
-        original = observed[0][0]
+        expected_recoveries = 1 if terminal is ToolCallState.TIMED_OUT else 0
+        assert len(cleanups) == 1 and len(observed) == expected_recoveries
+        original = cleanups[0]
         assert original.state is terminal
         runtime_before = deepcopy(dict(h.session.runtime_config))
         # A fresh value-equal notification must also deduplicate; object
@@ -652,6 +660,122 @@ async def test_replayed_internal_settlements_repeat_neither_cleanup_nor_model_ef
         h.runner._enqueue_tool_call_settlement(replay)
         h.runner._enqueue_tool_call_settlement(original)
         assert error_codes(await h.settle()) == []
-        assert len(cleanups) == len(observed) == 1
+        assert len(cleanups) == 1 and len(observed) == expected_recoveries
         assert h.session.runtime_config == runtime_before
         assert h.runner.tool_calls.record(call_id).state is terminal
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arguments", [{"x": 1}, ["x", 1], None])
+async def test_exposure_uses_identical_json_arguments_in_origin_and_wire(monkeypatch, arguments):
+    async with open_timed_harness(monkeypatch) as h:
+        await prepare(h)
+        captured = []
+        real_emit = h.runner.out.emit
+
+        def emit(payload):
+            if payload.get("type") == "function_call.done":
+                captured.append(dict(payload))
+            return real_emit(payload)
+
+        monkeypatch.setattr(h.runner.out, "emit", emit)
+        await h.runner.model._expose_function_call(
+            {"call_id": "structured-call", "name": "lookup", "arguments": arguments}
+        )
+        assert len(captured) == 1
+        call = h.runner.tool_calls.record("structured-call")
+        assert call is not None
+        assert call.origin.arguments == captured[0]["arguments"]
+        assert json.loads(call.origin.arguments) == arguments
+
+
+@pytest.mark.asyncio
+async def test_candidate_is_detached_before_terminal_cleanup_mutates_plugin_cache(monkeypatch):
+    async with open_timed_harness(monkeypatch) as h:
+        call_id = await prepare(h)
+        cache = {"values": [1]}
+        real_convert = h.runner.plugin.runtime_config_for_function_output
+
+        def convert(config, current, item):
+            candidate = real_convert(config, current, item)
+            candidate["cache_probe"] = cache
+            return candidate
+
+        def cleanup(settlement):
+            cache["values"].append(2)
+
+        monkeypatch.setattr(h.runner.plugin, "runtime_config_for_function_output", convert)
+        monkeypatch.setattr(h.runner.plugin, "on_tool_call_settled", cleanup)
+        assert error_codes(await answer(h, call_id)) == []
+        assert cache == {"values": [1, 2]}
+        assert h.session.runtime_config["cache_probe"] == {"values": [1]}
+        cache["values"].append(3)
+        assert h.session.runtime_config["cache_probe"] == {"values": [1]}
+
+
+@pytest.mark.asyncio
+async def test_timeout_candidate_does_not_alias_plugin_owned_values(monkeypatch):
+    async with open_timed_harness(monkeypatch) as h:
+        await prepare(h)
+        cache = {"values": [1]}
+
+        def recover(config, current, settlement):
+            return {**current, "cache_probe": cache}
+
+        monkeypatch.setattr(h.runner.plugin, "runtime_config_for_tool_call_timeout", recover)
+        h.clock.advance(TIMEOUT_S)
+        h.scheduler.fire_all()
+        assert error_codes(await h.settle()) == ["tool_result_timeout"]
+        cache["values"].append(2)
+        assert h.session.runtime_config["cache_probe"] == {"values": [1]}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("copy_failure", ["input", "candidate"])
+async def test_unexpected_preparation_failure_is_correlated_and_retryable(monkeypatch, copy_failure):
+    class Uncopyable:
+        def __deepcopy__(self, memo):
+            raise TypeError("plugin-owned object cannot be copied")
+
+    async with open_timed_harness(monkeypatch) as h:
+        call_id = await prepare(h)
+        before = dict(h.session.runtime_config)
+        real_convert = h.runner.plugin.runtime_config_for_function_output
+        if copy_failure == "input":
+            h.session.replace_runtime_config({**before, "copy_probe": Uncopyable()})
+        else:
+
+            def convert(config, current, item):
+                return {**real_convert(config, current, item), "copy_probe": Uncopyable()}
+
+            monkeypatch.setattr(h.runner.plugin, "runtime_config_for_function_output", convert)
+        events = await h.run(commands.CreateItem(item=output_item(call_id), event_id="prepare-failed"))
+        assert error_codes(events) == ["commit_aborted"]
+        assert errors(events)[0].related_event_id == "prepare-failed"
+        assert "conversation.item.created" not in types(events)
+        assert h.runner.tool_calls.record(call_id).state is ToolCallState.PENDING
+        assert generation(h) == 0 and batches(h) == []
+        h.session.replace_runtime_config(before)
+        monkeypatch.setattr(h.runner.plugin, "runtime_config_for_function_output", real_convert)
+        assert error_codes(await answer(h, call_id)) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", [ToolCallState.ACCEPTED, ToolCallState.CANCELLED])
+async def test_non_timeout_decisions_cannot_enter_the_model_recovery_hook(monkeypatch, terminal):
+    async with open_timed_harness(monkeypatch) as h:
+        call_id = await prepare(h)
+        recoveries = []
+
+        def poison(config, current, settlement):
+            recoveries.append(settlement)
+            return {"unexpected_reconfiguration": True}
+
+        monkeypatch.setattr(h.runner.plugin, "runtime_config_for_tool_call_timeout", poison)
+        if terminal is ToolCallState.ACCEPTED:
+            assert error_codes(await answer(h, call_id)) == []
+            assert generation(h) == 1 and len(batches(h)) == 1
+        else:
+            assert error_codes(await h.run(commands.CancelInput())) == []
+        assert recoveries == []
+        assert "unexpected_reconfiguration" not in h.session.runtime_config

@@ -101,7 +101,12 @@ from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
-from vllm_omni.engine.duplex.session.tool_calls import LoopTimerScheduler, ToolCallLedger, ToolCallSettlement
+from vllm_omni.engine.duplex.session.tool_calls import (
+    LoopTimerScheduler,
+    ToolCallLedger,
+    ToolCallSettlement,
+    ToolCallState,
+)
 from vllm_omni.engine.duplex.turn_detection import (
     TurnDetectionResult,
 )
@@ -832,6 +837,11 @@ class DuplexSessionRunner:
             return
         if not self._finalize_tool_call(settlement):
             return
+        # Acceptance installs only its prepared candidate; cancellation already
+        # has an epoch-wide retirement path. Neither can reconfigure through
+        # the deferred timeout-recovery hook after an acknowledgement.
+        if settlement.state is not ToolCallState.TIMED_OUT:
+            return
         call_id = settlement.origin.call_id
         if call_id in self._applied_tool_call_settlements:
             return
@@ -840,11 +850,11 @@ class DuplexSessionRunner:
             if settlement.settled_epoch != session.epoch:
                 # Finalize old metadata, but never change the new epoch's input.
                 return
-            candidate = self.plugin.runtime_config_for_tool_call_settlement(
+            candidate = self.plugin.runtime_config_for_tool_call_timeout(
                 session.config, deepcopy(dict(session.runtime_config)), settlement
             )
             if candidate is not None:
-                session.replace_runtime_config(candidate)
+                session.replace_runtime_config(deepcopy(candidate))
         except Exception as exc:
             logger.exception("Failed to apply tool-call settlement: %s", exc)
             self._emit_error(

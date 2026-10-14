@@ -546,15 +546,15 @@ class DuplexModelPlugin(ABC):
         """
         del origins
 
-    def runtime_config_for_tool_call_settlement(
+    def runtime_config_for_tool_call_timeout(
         self,
         config: DuplexSessionConfig,
         current: Mapping[str, object],
         settlement: ToolCallSettlement,
     ) -> dict[str, object] | None:
-        """Handle one new terminal decision on the session mailbox.
+        """Prepare model recovery for one newly timed-out call on the mailbox.
 
-        This is called for a terminal decision still in the current epoch,
+        This is called only for a timeout still in the current epoch,
         never during speculative result conversion. Cached metadata cleanup
         belongs in ``on_tool_call_settled`` and runs even if an epoch changed.
         Plugins may prepare call-scoped model recovery here. Returning ``None``
@@ -564,8 +564,8 @@ class DuplexModelPlugin(ABC):
 
         Raising closes the session: the owner cannot safely retry partial
         model/bookkeeping effects. Closed or superseded decisions are skipped.
-        Accepted results must already be usable from their prepared candidate;
-        this deferred hook cannot perform work required before their wire ack.
+        Accepted and cancelled calls never enter this hook. Their prepared
+        delivery or epoch-wide cancellation path remains the only model effect.
         """
         del config, current, settlement
         return None

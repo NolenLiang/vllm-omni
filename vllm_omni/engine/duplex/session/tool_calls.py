@@ -198,6 +198,8 @@ class ToolCallLedger:
         #: Called by the timer callback with the call id only -- enqueueing, never
         #: deciding. The decision is the mailbox handler's (``expire``).
         self._on_expire = on_expire
+        # Enqueue-only notification: the owner must not mutate this ledger or
+        # perform plugin/model work synchronously from the callback.
         self._on_settle = on_settle
         self._scheduler: TimerScheduler | None = None
         self._closed = False
@@ -333,20 +335,19 @@ class ToolCallLedger:
             return ToolCallRejection.EXPIRED
         return None
 
-    def commit_accept(self, acceptance: ToolCallAcceptance, *, epoch: int | None = None) -> bool:
+    def commit_accept(self, acceptance: ToolCallAcceptance, *, epoch: int) -> bool:
         """Recheck and settle atomically; the caller must respect a refusal.
 
         Conversion can cross a deadline even without yielding to the loop.
         Keep the final eligibility check inside the settlement operation so a
         caller cannot install a candidate using an earlier successful check.
         """
-        current_epoch = acceptance.epoch if epoch is None else epoch
-        if self.revalidate(acceptance, epoch=current_epoch) is not None:
+        if self.revalidate(acceptance, epoch=epoch) is not None:
             return False
         call = self._calls.get(acceptance.call_id)
         if call is None or not call.is_pending:
             return False
-        self._settle(call, ToolCallState.ACCEPTED, epoch=current_epoch)
+        self._settle(call, ToolCallState.ACCEPTED, epoch=epoch)
         return True
 
     def expire(self, call_id: object, *, now: float | None = None) -> bool:
