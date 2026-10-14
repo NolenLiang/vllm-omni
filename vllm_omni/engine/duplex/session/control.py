@@ -390,11 +390,25 @@ class SessionControl:
         if rejection is not None:
             self._reject_function_call_output(rejection, call_id, event_id=event_id)
             return
+        call = ledger.record(acceptance.call_id)
+        if call is None:
+            self._out.emit_error(
+                "commit_aborted", "the function-call context is no longer available", event_id=event_id
+            )
+            return
         try:
+            # The client returns a result, not an authoritative function name
+            # or argument list. Adaptation uses the call this session exposed.
+            prepared_item = {key: value for key, value in item.items() if key not in {"name", "arguments"}}
+            prepared_item["call_id"] = call.origin.call_id
+            if call.origin.name is not None:
+                prepared_item["name"] = call.origin.name
+            if call.origin.arguments is not None:
+                prepared_item["arguments"] = call.origin.arguments
             candidate_runtime_config = self._ctx.plugin.runtime_config_for_function_output(
                 session.config,
                 deepcopy(dict(session.runtime_config)),
-                item,
+                deepcopy(prepared_item),
             )
             # Detach returned plugin-owned objects before terminal cleanup can
             # mutate or release them, while refusal is still retryable.

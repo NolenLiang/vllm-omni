@@ -523,6 +523,11 @@ class DuplexModelPlugin(ABC):
         The session revalidates epoch and deadline after conversion. Do not
         consume a call's cached metadata here: a candidate can still be refused.
         Terminal bookkeeping belongs in ``on_tool_call_settled``.
+        ``item`` is an isolated preparation copy. Its ``name`` and ``arguments``
+        come only from the session's immutable call origin, when available;
+        client-supplied hints are ignored. Plugins requiring that context must
+        refuse missing metadata instead of guessing an association. The public
+        acknowledgement still carries the original submitted item.
         Plugins without tools keep the default (no change).
         """
         del config, current, item

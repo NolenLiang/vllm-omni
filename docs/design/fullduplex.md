@@ -477,6 +477,28 @@ Frame-based plugins use `engine/duplex/intermediate.py::build_duplex_append_prom
 for the shared request identity, sequencing and config snapshots. Token budgets,
 PCM framing and model-specific worker fields remain in the plugins.
 
+Tool result conversion is preparation until the session's final deadline/epoch
+check and admission. `runtime_config_for_function_output` receives an isolated
+item copy with `name` and `arguments` from the immutable session call origin,
+when available. Client-supplied hints for those fields are ignored; a plugin
+requiring absent metadata rejects the result before admission. The client
+acknowledgement retains the submitted item. Parsing and conversion should not
+consume a separate call-metadata cache before admission.
+
+A preparation refusal leaves the call pending and does not reset its deadline.
+Missing origin metadata cannot be repaired with client hints: a plugin that
+requires it keeps refusing retries until the call times out or is cancelled.
+When the optional timeout is disabled, cancellation or session teardown is
+required to retire such a call.
+
+`on_tool_call_settled` handles metadata-only terminal cleanup, including old
+epochs; `on_tool_calls_closed` disposes registered call metadata during teardown.
+Model recovery uses the mailbox-ordered `runtime_config_for_tool_call_timeout`
+only for a timeout in the current epoch. These hooks default to no-ops: a model
+adapter must implement and validate its recovery behavior. Accepted results use
+their prepared candidate, while effective epoch cancellation uses
+`retire_pending_function_output` for queued work according to model policy.
+
 See [supported models and deployments](../serving/full_duplex_api.md#enable-full-duplex)
 for the current plugin integrations and deployment configurations.
 
