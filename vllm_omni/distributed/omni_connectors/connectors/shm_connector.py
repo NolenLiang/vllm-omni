@@ -361,7 +361,6 @@ class SharedMemoryConnector(OmniConnectorBase):
         if not force and owner.retry_at is not None:
             if owner.cleanup_attempts >= 3 or time.monotonic() < owner.retry_at:
                 return False
-        owner.cleanup_attempts += 1
         lock_file = f"/dev/shm/shm_{key}_lockfile.lock"
         try:
             identity = _identity(f"/dev/shm/{key}")
@@ -372,9 +371,16 @@ class SharedMemoryConnector(OmniConnectorBase):
                 self._pending_keys.pop(key)
                 return False
             with open(lock_file, "rb+") as lockf:
-                fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    # A busy transfer has not attempted cleanup. Retry on the
+                    # next maintenance pass without spending its error budget.
+                    owner.retry_at = time.monotonic() + 0.1
+                    return False
                 if _lock_identity(lockf) != owner.lock_identity or _identity(lock_file) != owner.lock_identity:
-                    raise BlockingIOError("SHM lock generation changed")
+                    owner.retry_at = time.monotonic() + 0.1
+                    return False
                 # Identity check AND unlink share the writer/consumer lock.
                 # A stat check alone would allow deleting a replacement segment.
                 identity = _identity(f"/dev/shm/{key}")
@@ -395,6 +401,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         except OSError as e:
             # Reuse the adapter's periodic reap_consumed maintenance. Duplicate
             # cleanup calls share this budget; failed ownership is never dropped.
+            owner.cleanup_attempts += 1
             owner.retry_at = time.monotonic() + 0.1 * 2 ** min(owner.cleanup_attempts - 1, 1)
             if owner.cleanup_attempts == 3:
                 logger.warning("SHM cleanup retry budget exhausted for %s; retained for close: %s", key, e)
@@ -412,9 +419,24 @@ class SharedMemoryConnector(OmniConnectorBase):
         """One immediate attempt per owned segment, including exhausted retries."""
         with self._pending_keys_lock:
             keys = list(self._pending_keys)
-        for key in keys:
-            self._cleanup(key, force=True)
-        self._close_wakeups()
+        error = None
+        try:
+            for key in keys:
+                try:
+                    self._cleanup(key, force=True)
+                except Exception as exc:
+                    # Finish all teardown before reporting the first unexpected
+                    # error. The failed segment remains owned for another close.
+                    if error is None:
+                        error = exc
+        finally:
+            try:
+                self._close_wakeups()
+            except Exception as exc:
+                if error is None:
+                    error = exc
+        if error is not None:
+            raise error
 
     def reap_consumed(self, *, max_keys: int = 64) -> None:
         """Bounded sweep of consumed keys and due cleanup retries.

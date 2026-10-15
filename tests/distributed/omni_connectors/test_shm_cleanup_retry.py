@@ -89,6 +89,12 @@ class TestSharedMemoryCleanupRetry(unittest.TestCase):
             self.assertEqual(self.connector.get("0", "1", peer)[0], "peer")
 
     def test_persistent_failure_is_bounded_and_close_flushes_once(self):
+        self._check_persistent_failure(errno.EACCES)
+
+    def test_unlink_blocking_io_error_still_exhausts_cleanup_budget(self):
+        self._check_persistent_failure(errno.EAGAIN)
+
+    def _check_persistent_failure(self, error_number):
         key = self.put()
         real_unlink = _posixshmem.shm_unlink
         attempts = []
@@ -97,7 +103,7 @@ class TestSharedMemoryCleanupRetry(unittest.TestCase):
         def fail_target(name):
             if name.lstrip("/") == key:
                 attempts.append(clock[0])
-                raise PermissionError(errno.EACCES, "persistent cleanup failure", name)
+                raise OSError(error_number, "persistent cleanup failure", name)
             return real_unlink(name)
 
         with (
@@ -202,6 +208,37 @@ class TestSharedMemoryCleanupRetry(unittest.TestCase):
             self.connector.reap_consumed()
         self.assertIn(key, self.connector._pending_keys)
 
+    def test_close_finishes_teardown_before_propagating_cleanup_error(self):
+        failed_key = self.put()
+        other_key = self.put("other payload")
+        self.assertIsNotNone(self.connector.get_wakeup_generation())
+        wake_path = self.connector._wake_path
+        wake_fds = (self.connector._wake_read_fd, self.connector._wake_hold_fd)
+        real_unlink = _posixshmem.shm_unlink
+        error = RuntimeError("unexpected close error")
+
+        def fail_target(name):
+            if name.lstrip("/") == failed_key:
+                raise error
+            return real_unlink(name)
+
+        with patch.object(_posixshmem, "shm_unlink", fail_target):
+            with self.assertRaises(RuntimeError) as raised:
+                self.connector.close()
+        self.assertIs(raised.exception, error)
+        self.assertIn(failed_key, self.connector._pending_keys)
+        self.assertNotIn(other_key, self.connector._pending_keys)
+        self.assertFalse(os.path.exists(f"/dev/shm/{other_key}"))
+        self.assertFalse(os.path.exists(f"/dev/shm/shm_{other_key}_lockfile.lock"))
+        self.assertTrue(self.connector._wake_closed)
+        self.assertIsNone(self.connector._wake_read_fd)
+        self.assertIsNone(self.connector._wake_hold_fd)
+        self.assertFalse(os.path.exists(wake_path))
+        for fd in wake_fds:
+            with self.assertRaises(OSError) as closed:
+                os.fstat(fd)
+            self.assertEqual(closed.exception.errno, errno.EBADF)
+
     def test_cleanup_and_replacement_writer_share_the_same_lock(self):
         self._check_waiting_writer("cleanup")
 
@@ -287,17 +324,26 @@ class TestSharedMemoryCleanupRetry(unittest.TestCase):
     def test_cleanup_never_waits_for_a_busy_transfer_lock(self):
         key = self.put()
         lock_path = f"/dev/shm/shm_{key}_lockfile.lock"
-        with open(lock_path, "rb+") as lockf:
-            fcntl.flock(lockf, fcntl.LOCK_EX)
-            started = time.monotonic()
-            self.connector.cleanup(key)
-            self.assertLess(time.monotonic() - started, 0.5)
-            self.assertIn(key, self.connector._pending_keys)
-            self.assertTrue(os.path.exists(f"/dev/shm/{key}"))
-            self.assertIsNone(self.connector.get_with_deadline("0", "1", key, deadline=time.monotonic() + 1))
-        self.connector.close()
+        clock = [100.0]
+        with patch.object(shm_connector, "time", SimpleNamespace(monotonic=lambda: clock[0])):
+            with open(lock_path, "rb+") as lockf:
+                fcntl.flock(lockf, fcntl.LOCK_EX)
+                started = time.monotonic()
+                self.connector.cleanup(key)
+                # A transfer can remain busy beyond every cleanup backoff.
+                for now in (100.11, 100.32, 101.0, 102.0):
+                    clock[0] = now
+                    self.connector.reap_consumed()
+                self.assertLess(time.monotonic() - started, 0.5)
+                self.assertIn(key, self.connector._pending_keys)
+                self.assertEqual(self.connector._pending_keys[key].cleanup_attempts, 0)
+                self.assertTrue(os.path.exists(f"/dev/shm/{key}"))
+                self.assertIsNone(self.connector.get_with_deadline("0", "1", key, deadline=clock[0] + 1))
+            clock[0] = 103.0
+            self.connector.reap_consumed()
         self.assertNotIn(key, self.connector._pending_keys)
         self.assertFalse(os.path.exists(f"/dev/shm/{key}"))
+        self.assertFalse(os.path.exists(lock_path))
 
     def test_same_producer_reuse_does_not_inherit_old_cleanup_request(self):
         key = self.put("old")
