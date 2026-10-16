@@ -613,16 +613,28 @@ class DuplexSessionConfig:
         modalities = payload.get("modalities") or payload.get("output_modalities")
         if isinstance(modalities, list) and all(isinstance(item, str) for item in modalities):
             self.modalities = list(modalities)
-        if TOOL_RESULT_TIMEOUT_KEY in payload or (
-            isinstance(payload.get("extra_body"), dict) and TOOL_RESULT_TIMEOUT_KEY in payload["extra_body"]
-        ):
-            # Calls may already be pending under the old deadline; a live change
-            # would leave "is this result in time?" undecidable.
-            raise DuplexConfigError(
-                "session.update cannot change tool_result_timeout_s after the session is open",
-                code="tool_result_timeout_update_unsupported",
-                param=TOOL_RESULT_TIMEOUT_KEY,
-            )
+        # A realtime client resends the whole session. Reject only a real change,
+        # including set versus unset. Calls may already be pending under the old
+        # deadline; a live change would leave "is this result in time?" undecidable.
+        extra_body_patch = payload.get("extra_body")
+        if isinstance(extra_body_patch, dict) and TOOL_RESULT_TIMEOUT_KEY in extra_body_patch:
+            timeout_patch: object = extra_body_patch[TOOL_RESULT_TIMEOUT_KEY]
+            timeout_present = True
+        elif TOOL_RESULT_TIMEOUT_KEY in payload:
+            timeout_patch = payload[TOOL_RESULT_TIMEOUT_KEY]
+            timeout_present = True
+        else:
+            timeout_patch = None
+            timeout_present = False
+        if timeout_present:
+            proposed_timeout = resolve_tool_result_timeout_s({TOOL_RESULT_TIMEOUT_KEY: timeout_patch})
+            current_timeout = resolve_tool_result_timeout_s(self.extra_body)
+            if proposed_timeout != current_timeout:
+                raise DuplexConfigError(
+                    "session.update cannot change tool_result_timeout_s after the session is open",
+                    code="tool_result_timeout_update_unsupported",
+                    param=TOOL_RESULT_TIMEOUT_KEY,
+                )
         if isinstance(payload.get("extra_body"), dict):
             self.extra_body.update(payload["extra_body"])
             extra = payload["extra_body"]

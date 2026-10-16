@@ -560,6 +560,8 @@ async def test_a_failed_retirement_ends_the_session_instead_of_leaking_the_batch
     assert "tool_result_retirement_failed" in error_codes(events) or "tool_result_retirement_failed" in error_codes(
         h.events
     )
+    assert "audio.cancelled" not in types(events)
+    assert "input.cancelled" not in types(events)
     # Fail closed: the session is terminating (synchronously, at the moment the
     # retirement failed) and its ledger is already gone.
     assert h.runner.closing is True
@@ -839,16 +841,18 @@ async def test_a_result_that_arrives_at_the_deadline_is_refused_without_the_time
     async with open_timed_harness(monkeypatch) as h:
         call_id = await prepare(h)
 
-        # Strictly before the deadline is accepted, at the deadline is not: the
-        # result is refused by the admission check even though the timer has not
-        # fired and no timeout event was ever enqueued.
+        # Strictly before the deadline is accepted, at the deadline is not.
+        # The timer has not fired. Settling the late result still emits exactly
+        # one tool_result_timeout, and the later timer callback does not repeat it.
         h.clock.advance(TIMEOUT_S)
         refused = await answer(h, call_id)
-        assert error_codes(refused) == ["invalid_function_call_output"]
+        assert error_codes(refused) == ["invalid_function_call_output", "tool_result_timeout"]
         assert errors(refused)[0].param == "item.call_id"
         assert h.runner.tool_calls.record(call_id).state is ToolCallState.TIMED_OUT
         assert "tool_result_timeout_s" in errors(refused)[0].message
         assert h.scheduler.pending_delays() == []
+        h.scheduler.fire_all()
+        assert error_codes(await h.settle()) == []
         assert generation(h) == 0
 
 
@@ -868,7 +872,7 @@ async def test_a_result_that_misses_its_deadline_while_the_append_tail_waits_is_
         h.runner.control._wait_for_append_tail = slow_tail  # type: ignore[method-assign]
         refused = await answer(h, call_id)
 
-        assert error_codes(refused) == ["invalid_function_call_output"]
+        assert error_codes(refused) == ["invalid_function_call_output", "tool_result_timeout"]
         assert errors(refused)[0].param == "item.call_id"
         assert "tool_result_timeout_s" in errors(refused)[0].message
         assert h.runner.tool_calls.record(call_id).state is ToolCallState.TIMED_OUT
@@ -895,7 +899,7 @@ async def test_a_result_that_misses_its_deadline_while_the_plugin_renders_it_is_
         submissions_before = len(h.port.submissions)
         refused = await answer(h, call_id)
 
-        assert error_codes(refused) == ["invalid_function_call_output"]
+        assert error_codes(refused) == ["invalid_function_call_output", "tool_result_timeout"]
         assert errors(refused)[0].param == "item.call_id"
         assert h.runner.tool_calls.record(call_id).state is ToolCallState.TIMED_OUT
         # Nothing was committed: no item for the client, no queued batch, and no

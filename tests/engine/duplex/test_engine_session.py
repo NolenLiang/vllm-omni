@@ -773,6 +773,27 @@ def test_apply_realtime_update_rejects_tool_result_timeout_change():
     assert resolve_tool_result_timeout_s(config.extra_body) == 5.0
 
 
+def test_apply_realtime_update_keeps_an_unchanged_tool_result_timeout():
+    config = DuplexSessionConfig(model="served-model", extra_body={"tool_result_timeout_s": 5.0})
+
+    config.apply_realtime_update({"instructions": "still here", "tool_result_timeout_s": 5}, session_id="sid")
+    config.apply_realtime_update({"extra_body": {"tool_result_timeout_s": 5.0}}, session_id="sid")
+
+    assert config.instructions == "still here"
+    assert resolve_tool_result_timeout_s(config.extra_body) == 5.0
+
+    unset = DuplexSessionConfig(model="served-model")
+    unset.apply_realtime_update({"tool_result_timeout_s": None}, session_id="sid")
+    assert resolve_tool_result_timeout_s(unset.extra_body) is None
+    with pytest.raises(DuplexConfigError) as excinfo:
+        unset.apply_realtime_update({"extra_body": {"tool_result_timeout_s": 1.0}}, session_id="sid")
+    assert excinfo.value.code == "tool_result_timeout_update_unsupported"
+    with pytest.raises(DuplexConfigError) as excinfo:
+        config.apply_realtime_update({"tool_result_timeout_s": None}, session_id="sid")
+    assert excinfo.value.code == "tool_result_timeout_update_unsupported"
+    assert resolve_tool_result_timeout_s(config.extra_body) == 5.0
+
+
 def test_apply_realtime_update_patches_fields_and_realtime_keys():
     config = DuplexSessionConfig(model="m", instructions="old", extra_body={"realtime_tools": [{"name": "x"}]})
 
@@ -967,7 +988,12 @@ def test_end_response_logs_pending_and_active_stage_request_stats(monkeypatch: p
 
 def test_end_response_prints_one_column_per_stage(monkeypatch: pytest.MonkeyPatch):
     logged: list[OrchestratorAggregator] = []
-    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: logged.append(self) or {})
+
+    def _record_summary(self):
+        logged.append(self)
+        return {}
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", _record_summary)
     session = _session(num_stages=3, log_stats=True)
     session.observe_stage_request_stats(0, _stage_stats(stage_id=0, num_tokens_out=3, vllm_ttft_ms=40.0))
     response_id = session.begin_response()
@@ -1135,7 +1161,12 @@ def test_logged_e2e_includes_wait_before_first_output(monkeypatch: pytest.Monkey
     wall = {"t": 1_000.0}
     monkeypatch.setattr(time, "time", lambda: wall["t"])
     logged: list[OrchestratorAggregator] = []
-    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: logged.append(self) or {})
+
+    def _record_summary(self):
+        logged.append(self)
+        return {}
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", _record_summary)
     session = _session(log_stats=True, clock=lambda: mono["t"])
     session.mark_model_turn_request_started(0, 100.0)
 
@@ -1155,7 +1186,12 @@ def test_logged_e2e_includes_wait_before_first_output(monkeypatch: pytest.Monkey
 
 def test_logged_tpot_matches_client_weighted_aggregation(monkeypatch: pytest.MonkeyPatch) -> None:
     logged: list[OrchestratorAggregator] = []
-    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", lambda self: logged.append(self) or {})
+
+    def _record_summary(self):
+        logged.append(self)
+        return {}
+
+    monkeypatch.setattr(OrchestratorAggregator, "build_and_log_summary", _record_summary)
     session = _session(log_stats=True)
     response_id = session.begin_response()
     session.observe_stage_request_stats(0, _stage_stats(stage_id=0, num_tokens_out=11, vllm_tpot_ms=10.0))

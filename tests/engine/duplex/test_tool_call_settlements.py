@@ -213,7 +213,7 @@ def install_recorder(monkeypatch, h):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("entry", ["begin_accept", "revalidate", "expire"])
-async def test_runner_unifies_expiry_notifications_without_changing_wire_errors(monkeypatch, entry):
+async def test_runner_emits_one_timeout_notice_for_every_expiry_entry(monkeypatch, entry):
     async with open_timed_harness(monkeypatch) as h:
         call_id = await prepare(h)
         observed = install_recorder(monkeypatch, h)
@@ -237,7 +237,7 @@ async def test_runner_unifies_expiry_notifications_without_changing_wire_errors(
 
                 monkeypatch.setattr(h.runner.control, "_wait_for_append_tail", slow_tail)
             events = await h.run(commands.CreateItem(item=output_item(call_id), event_id="result-at-deadline"))
-            assert error_codes(events) == ["invalid_function_call_output"]
+            assert error_codes(events) == ["invalid_function_call_output", "tool_result_timeout"]
             assert errors(events)[0].param == "item.call_id"
             assert errors(events)[0].related_event_id == "result-at-deadline"
 
