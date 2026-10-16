@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from typing import Any
 
 import torch
@@ -10,6 +13,7 @@ CHUNK_METADATA_KEYS: frozenset[str] = frozenset(
         "audio_text_total_chars",
         "duplex_epoch",
         "duplex_turn_id",
+        "finished",
         "llm_output_text_utf8",
         "segment_end",
         "tts_is_last_chunk",
