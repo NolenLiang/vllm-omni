@@ -83,6 +83,7 @@ def test_every_expiry_entry_notifies_the_same_committed_fact_once(entry):
     acceptance = ledger.begin_accept("call_a")
     assert isinstance(acceptance, ToolCallAcceptance)
     late_callback = scheduler.timers[0][2]
+    assert callable(late_callback)
     clock.advance(5.0)
 
     if entry == "begin_accept":

@@ -938,7 +938,7 @@ class DuplexSessionRunner:
         self._emit_error(
             "tool_result_timeout",
             f"no function_call_output for {call_id} arrived before tool_result_timeout_s; "
-            "the call was abandoned and a late result is refused",
+            "the call expired in the session ledger and a late result is refused",
         )
 
     # ------------------------------------------------------------------ #

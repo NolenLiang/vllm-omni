@@ -673,10 +673,10 @@ class DuplexSessionRuntimeConfig:
     max_pending_output_events_per_session: int = 512
     max_sessions: int = 1
     # Total function-call records one session may track until it closes --
-    # pending calls and terminal tombstones together. Exceeding it fails the
-    # session instead of evicting a record: an evicted tombstone is exactly the
-    # call-id reuse that keeps a late ``function_call_output`` from binding to a
-    # newer call.
+    # pending calls and terminal tombstones together. At the limit, new calls
+    # are refused without closing the session or evicting records. Keeping
+    # terminal tombstones prevents a late ``function_call_output`` from binding
+    # to a newer call that reuses its call_id.
     max_tool_calls_per_session: int = 4096
     # Unread by the plugin framework. It used to bound the per-session
     # completed-append table that made a retried append RPC submit once; the
