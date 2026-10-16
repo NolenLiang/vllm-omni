@@ -337,18 +337,30 @@ call is exposed. A result that arrives strictly before it is accepted; one that
 arrives at or after it is refused as a timeout (`invalid_function_call_output`,
 `param: "item.call_id"`). The deadline is not a promise that a deadline event
 arrives first: when the expiry timer settles a call, the session emits an
-`error` with `code: "tool_result_timeout"` naming the abandoned `call_id`.
+`error` with `code: "tool_result_timeout"` naming the expired `call_id`.
 If result admission observes the deadline first, its correlated
 `invalid_function_call_output` reports the timeout instead. No business result
-is fabricated, and input keeps flowing -- the next call in the same session,
-including one in the same turn, is answered normally. Closing the session
-disarms every pending deadline.
+is fabricated, and input keeps flowing. If the model emits another call in the
+same session, including the same turn, that call can be answered normally.
+Closing the session disarms every pending deadline.
+
+This deadline settles the session ledger and rejects late results; it does not
+by itself make the model abandon a call or guarantee that it emits another one.
+Model recovery requires an adapter implementation of
+`runtime_config_for_tool_call_timeout`. The native Nemotron adapter currently
+inherits the no-op hook, so enabling its deadline does not guarantee native
+timeout recovery. The session admission and settlement support here is also
+separate from Qwen tool-result delivery in
+[#8493](https://github.com/vllm-project/vllm-omni/pull/8493); this runtime change
+alone does not establish Qwen tool-call end-to-end support.
 
 Deployment setting `duplex_session.max_tool_calls_per_session` (default 4096)
 bounds the records one session may track, pending calls and settled tombstones
-together, until it closes; it must be a positive integer. Exceeding it fails the
-session (`resource_exhausted`) rather than evicting a record, because an evicted
-tombstone is exactly the call-id reuse the tombstones prevent.
+together, until it closes; it must be a positive integer. At the limit, a new
+call is refused with `resource_exhausted` without being exposed to the client.
+The session stays open: already pending calls can still receive results, and
+audio processing continues. Records are not evicted and the budget is not
+replenished until the session closes, preserving protection against call-id reuse.
 
 ### Measure latency
 

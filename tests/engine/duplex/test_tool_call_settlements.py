@@ -506,6 +506,7 @@ async def test_recognized_calls_are_registered_before_emission_and_invalid_calls
             await h.runner.model._expose_function_call(malformed)
         events = await h.settle()
         assert error_codes(events) == ["invalid_function_call", "invalid_function_call"]
+        assert all(error.to_realtime()["error"]["type"] == "invalid_request_error" for error in errors(events))
         assert len(exposed) == len(h.runner.tool_calls) == 1
         assert h.runner.tool_calls.record("bad") is None
 
@@ -558,6 +559,7 @@ async def test_accepted_cleanup_failure_installs_no_candidate_ack_or_continuatio
         assert len(converted) == 1 and converted[0]["nvc_function_response_generation"] == 1
         assert len(cleanups) == 1 and cleanups[0].state is ToolCallState.ACCEPTED
         assert error_codes(events) == ["tool_call_settlement_failed"]
+        assert errors(events)[0].to_realtime()["error"]["type"] == "server_error"
         assert "conversation.item.created" not in emitted
         assert "conversation.item.created" not in types(events)
         assert continuations == [] and observed == []

@@ -34,6 +34,7 @@ from tests.engine.duplex.test_session_runner import (
     RecordingStagePort,
     _fake_encode_audio,
     append_audio,
+    tts_output,
     types,
 )
 from tests.engine.duplex.test_tool_call_ledger import FakeTimerScheduler
@@ -316,6 +317,56 @@ async def test_the_exposed_call_is_registered_before_the_client_can_answer_it(ha
     assert record.origin.item_id == done.item_id
     assert record.origin.response_id == done.response_id
     assert error_codes(h.events) == []
+
+
+@pytest.mark.asyncio
+async def test_call_budget_refuses_new_calls_without_interrupting_pending_results_or_audio(monkeypatch):
+    limits = DuplexSessionRuntimeConfig(max_tool_calls_per_session=1)
+    async with open_nemotron_harness(monkeypatch, runtime_config=limits) as h:
+        call_id = await prepare(h)
+        pending = h.runner.tool_calls.record(call_id)
+        events = []
+        for token_id in (20, 7, 21):
+            events.extend(await deliver(h, nvc_function_token=[token_id]))
+
+        assert error_codes(events) == ["resource_exhausted"]
+        assert errors(events)[0].to_realtime()["error"]["type"] == "rate_limit_error"
+        assert "response.function_call_arguments.done" not in types(events)
+        assert "session.closed" not in types(events)
+        assert not h.runner.closing
+        assert pending.state is ToolCallState.PENDING
+        assert len(h.runner.tool_calls) == 1
+
+        submissions_before = len(h.port.submissions)
+        assert error_codes(await h.run(append_audio(samples=1280))) == []
+        assert len(h.port.submissions) == submissions_before + 1
+        assert error_codes(await answer(h, call_id)) == []
+        assert pending.state is ToolCallState.ACCEPTED
+        worker_state = _worker()
+        Thinker._sync_forced_function_response(worker_state, h.session.runtime_config)
+        assert worker_state["forced_function_tokens"] == [42]
+
+        audio = tts_output(h.stage0_request_id(), samples=1764)
+        events = await h.deliver_and_settle(audio, stage_id=2, segment_finished=True)
+        assert error_codes(events) == []
+        delta = next(event for event in events if event.type == "response.output_audio.delta")
+        assert delta.delta == "wav-1764"
+        assert not h.runner.closing
+
+
+@pytest.mark.asyncio
+async def test_duplicate_call_registration_still_closes_the_session(harness):
+    h = harness
+    call_id = await prepare(h)
+    await h.runner.model._expose_function_call({"call_id": call_id, "name": "lookup", "arguments": "{}"})
+    events = await h.settle()
+
+    assert error_codes(events) == ["tool_call_registration_failed"]
+    assert errors(events)[0].to_realtime()["error"]["type"] == "server_error"
+    assert "response.function_call_arguments.done" not in types(events)
+    assert types(events).count("session.closed") == 1
+    assert h.session.state is DuplexSessionState.CLOSED
+    assert error_codes(await answer(h, call_id)) == ["unknown_session"]
 
 
 @pytest.mark.asyncio

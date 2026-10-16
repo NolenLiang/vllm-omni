@@ -953,7 +953,8 @@ class ModelChannel:
             )
         except ToolCallRegistrationError as exc:
             self._out.emit_error(exc.code, str(exc))
-            await self._close_from_runtime("tool_call_lifecycle")
+            if exc.code != "resource_exhausted":
+                await self._close_from_runtime("tool_call_lifecycle")
             return
         self._out.emit(
             {

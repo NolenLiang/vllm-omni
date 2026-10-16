@@ -495,7 +495,12 @@ required to retire such a call.
 epochs; `on_tool_calls_closed` disposes registered call metadata during teardown.
 Model recovery uses the mailbox-ordered `runtime_config_for_tool_call_timeout`
 only for a timeout in the current epoch. These hooks default to no-ops: a model
-adapter must implement and validate its recovery behavior. Accepted results use
+adapter must implement and validate its recovery behavior. Native Nemotron does
+not override the timeout hook: ledger expiry and late-result rejection do not
+establish native call abandonment or guarantee a subsequent model call. Qwen
+tool-result delivery is separate model-adapter work in
+[#8493](https://github.com/vllm-project/vllm-omni/pull/8493); session lifecycle
+support alone is not Qwen tool-call end-to-end support. Accepted results use
 their prepared candidate, while effective epoch cancellation uses
 `retire_pending_function_output` for queued work according to model policy.
 
