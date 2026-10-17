@@ -559,6 +559,7 @@ async def test_close_skips_retirement_after_the_ledger_is_closed() -> None:
             raise RuntimeError("the plugin cannot prove its queue is clean")
 
         h.runner.plugin.retire_pending_function_output = explode
+        epoch_before = h.runner.session.epoch
         await h.manager.handle(
             CloseDuplexSessionMessage(control_id="c-close-retire", session_id=SESSION_ID, reason="client_close")
         )
@@ -566,6 +567,7 @@ async def test_close_skips_retirement_after_the_ledger_is_closed() -> None:
         events = await h.settle()
 
         assert result.ok and result.operation == "close"
+        assert h.runner.session.epoch > epoch_before
         assert asked == []
         assert "tool_result_retirement_failed" not in [getattr(event, "code", None) for event in events]
         assert "session.closed" in types(events)
