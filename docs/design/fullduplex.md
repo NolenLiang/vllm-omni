@@ -587,6 +587,15 @@ support alone is not Qwen tool-call end-to-end support. Accepted results use
 their prepared candidate, while effective epoch cancellation uses
 `retire_pending_function_output` for queued work according to model policy.
 
+Nemotron's function-channel wire output is request-aligned. In runtime batches,
+the worker-provided spans select each request's last scheduled hidden row rather
+than CUDA-graph padding; the worker's payload split preserves that mapping for
+the session data plane. Intermediate prefill chunks expose no function token
+and keep empty slots in mixed batches. The final prefill chunk and decode frames
+can expose function tokens. Model-local postprocess feedback alone does not
+expose a client tool call. Forced feedback remains queued until an eligible
+frame's postprocess consumes it once.
+
 Turn plugins may bind their stage identities in `configure_pipeline` and select
 an append's entry with `input_stage_id(payload)` (default 0). The request context
 and orchestrator retain that entry stage. Session prompt preparation receives
