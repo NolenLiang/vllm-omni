@@ -793,6 +793,23 @@ def test_apply_realtime_update_keeps_an_unchanged_tool_result_timeout():
     assert excinfo.value.code == "tool_result_timeout_update_unsupported"
     assert resolve_tool_result_timeout_s(config.extra_body) == 5.0
 
+    opened = DuplexSessionConfig.from_realtime(
+        {"model": "served-model", "tool_result_timeout_s": 5, "extra_body": {"tool_result_timeout_s": 10}}
+    )
+    assert resolve_tool_result_timeout_s(opened.extra_body) == 5.0
+    opened.apply_realtime_update(
+        {"tool_result_timeout_s": 5, "extra_body": {"tool_result_timeout_s": 10}},
+        session_id="sid",
+    )
+    assert resolve_tool_result_timeout_s(opened.extra_body) == 5.0
+    with pytest.raises(DuplexConfigError) as excinfo:
+        opened.apply_realtime_update(
+            {"tool_result_timeout_s": 1, "extra_body": {"tool_result_timeout_s": 5}},
+            session_id="sid",
+        )
+    assert excinfo.value.code == "tool_result_timeout_update_unsupported"
+    assert resolve_tool_result_timeout_s(opened.extra_body) == 5.0
+
 
 def test_apply_realtime_update_patches_fields_and_realtime_keys():
     config = DuplexSessionConfig(model="m", instructions="old", extra_body={"realtime_tools": [{"name": "x"}]})

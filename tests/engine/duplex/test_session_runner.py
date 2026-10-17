@@ -513,6 +513,38 @@ async def test_close_emits_session_closed_and_releases_stage_requests() -> None:
 
 
 @pytest.mark.asyncio
+async def test_close_cancels_an_inflight_response_and_aborts_its_request() -> None:
+    saw_cancel = asyncio.Event()
+
+    async def inflight() -> None:
+        try:
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            saw_cancel.set()
+            raise
+
+    h = await open_harness()
+    task = asyncio.create_task(inflight())
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"))
+        h.runner.tasks.active_response_task = task
+        await h.manager.handle(
+            CloseDuplexSessionMessage(control_id="c-close-inflight", session_id=SESSION_ID, reason="client_close")
+        )
+        await asyncio.wait_for(h.results.get(), timeout=2.0)
+        await h.settle()
+        assert saw_cancel.is_set()
+        assert any(request_id in batch for batch in h.port.aborts)
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_idle_expiry_emits_session_expired() -> None:
     clock = {"now": 100.0}
     h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(idle_ttl_s=1.0), clock=lambda: clock["now"])

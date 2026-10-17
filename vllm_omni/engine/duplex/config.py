@@ -613,15 +613,17 @@ class DuplexSessionConfig:
         modalities = payload.get("modalities") or payload.get("output_modalities")
         if isinstance(modalities, list) and all(isinstance(item, str) for item in modalities):
             self.modalities = list(modalities)
-        # A realtime client resends the whole session. Reject only a real change,
-        # including set versus unset. Calls may already be pending under the old
-        # deadline; a live change would leave "is this result in time?" undecidable.
+        # A realtime client resends the whole session. Resolve the deadline the
+        # same way ``from_realtime`` does: a top-level key wins over ``extra_body``.
+        # Reject only a real change, including set versus unset. Calls may already
+        # be pending under the old deadline; a live change would leave "is this
+        # result in time?" undecidable.
         extra_body_patch = payload.get("extra_body")
-        if isinstance(extra_body_patch, dict) and TOOL_RESULT_TIMEOUT_KEY in extra_body_patch:
-            timeout_patch: object = extra_body_patch[TOOL_RESULT_TIMEOUT_KEY]
+        if TOOL_RESULT_TIMEOUT_KEY in payload:
+            timeout_patch: object = payload[TOOL_RESULT_TIMEOUT_KEY]
             timeout_present = True
-        elif TOOL_RESULT_TIMEOUT_KEY in payload:
-            timeout_patch = payload[TOOL_RESULT_TIMEOUT_KEY]
+        elif isinstance(extra_body_patch, dict) and TOOL_RESULT_TIMEOUT_KEY in extra_body_patch:
+            timeout_patch = extra_body_patch[TOOL_RESULT_TIMEOUT_KEY]
             timeout_present = True
         else:
             timeout_patch = None
@@ -644,6 +646,10 @@ class DuplexSessionConfig:
                 self.playback_commit_policy = self._normalize_playback_commit_policy(
                     str(extra["playback_commit_policy"])
                 )
+        if TOOL_RESULT_TIMEOUT_KEY in payload:
+            # ``extra_body.update`` above would otherwise store the nested value
+            # and change a deadline the top-level key just confirmed.
+            self.extra_body[TOOL_RESULT_TIMEOUT_KEY] = payload[TOOL_RESULT_TIMEOUT_KEY]
         if isinstance(payload.get("tools"), list):
             self.extra_body["realtime_tools"] = payload["tools"]
         elif "tools" in payload and payload.get("tools") is None:

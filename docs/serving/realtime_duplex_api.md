@@ -334,15 +334,15 @@ deadline (`tool_result_timeout_update_unsupported`):
 
 The deadline is measured on the session's monotonic clock from the moment the
 call is exposed. A result that arrives strictly before it is accepted; one that
-arrives at or after it is refused as a timeout (`invalid_function_call_output`,
-`param: "item.call_id"`). The deadline is not a promise that a deadline event
-arrives first: when the expiry timer settles a call, the session emits an
-`error` with `code: "tool_result_timeout"` naming the expired `call_id`.
-If result admission observes the deadline first, its correlated
-`invalid_function_call_output` reports the timeout instead. No business result
-is fabricated, and input keeps flowing. If the model emits another call in the
-same session, including the same turn, that call can be answered normally.
-Closing the session disarms every pending deadline.
+arrives at or after it is refused (`invalid_function_call_output`,
+`param: "item.call_id"`). The expiry timer and result admission each settle
+the call as timed out at most once, and that settlement emits one `error`
+with `code: "tool_result_timeout"` naming the expired `call_id`. When
+admission settles it, the correlated `invalid_function_call_output` is also
+present. The notices have no promised order. No business result is fabricated,
+and input keeps flowing. If the model emits another call in the same session,
+including the same turn, that call can be answered normally. Closing the
+session disarms every pending deadline.
 
 This deadline settles the session ledger and rejects late results; it does not
 by itself make the model abandon a call or guarantee that it emits another one.

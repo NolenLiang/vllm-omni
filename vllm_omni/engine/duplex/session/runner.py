@@ -805,7 +805,7 @@ class DuplexSessionRunner:
     # Epoch advance / tool-call ledger                                   #
     # ------------------------------------------------------------------ #
 
-    def _advance_epoch(self) -> tuple[int, dict[str, int]] | None:
+    def _advance_epoch(self) -> tuple[int, dict[str, int], bool]:
         """Advance the barge-in epoch and let every epoch-scoped owner observe it.
 
         The only way the session's epoch moves: an epoch bump is the one
@@ -815,26 +815,28 @@ class DuplexSessionRunner:
         not consumed yet being retired -- hang off this call instead of being
         repeated at each of the seven sites that cancel something.
 
-        ``None`` means retirement failed and the session is already closing.
-        Callers must not emit a further ``audio.cancelled`` or ``input.cancelled``.
+        The bool is false only when this bump's retirement failed and closed
+        the session. Callers still finish request teardown; they must not emit
+        a further ``audio.cancelled`` or ``input.cancelled``. A close that was
+        already in progress stays true, so its teardown is not skipped.
         """
         session = self.session
         old_epoch = session.epoch
         new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
+        retired = True
         if new_epoch != old_epoch:
             self.tool_calls.invalidate_epoch(new_epoch)
-            self._retire_pending_function_output()
-        if self.run.closing:
-            return None
-        return new_epoch, old_playback
+            retired = self._retire_pending_function_output()
+        return new_epoch, old_playback, retired
 
-    def _retire_pending_function_output(self) -> None:
+    def _retire_pending_function_output(self) -> bool:
         """Drop tool results the model accepted but never consumed.
 
         An accepted result is written into the session's runtime config, and
         some runtimes only apply it on their next frame. Cancelling the epoch
         under it must not let it speak in the new generation, so the plugin is
-        asked to retire what is still queued.
+        asked to retire what is still queued. False means the session is closing
+        because the plugin could not prove the queue is clean.
         """
         session = self.session
         try:
@@ -852,9 +854,10 @@ class DuplexSessionRunner:
             )
             self._begin_close("tool_result_retirement_failed")
             self.manager.close_from_runner(self, "tool_result_retirement_failed")
-            return
+            return False
         if candidate is not None:
             session.replace_runtime_config(candidate)
+        return True
 
     def _enqueue_tool_call_settlement(self, settlement: ToolCallSettlement) -> None:
         """Keep every settlement path on one ordered model-effect boundary."""
@@ -1018,10 +1021,9 @@ class DuplexSessionRunner:
             old_response_id = session.active_response_id
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, old_response_id, committed_ms)
-            advanced = self._advance_epoch()
-            if advanced is None:
+            new_epoch, old_playback, retired = self._advance_epoch()
+            if not retired:
                 return False
-            new_epoch, old_playback = advanced
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -1039,10 +1041,9 @@ class DuplexSessionRunner:
             old_epoch = session.epoch
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, session.last_response_id, committed_ms)
-            advanced = self._advance_epoch()
-            if advanced is None:
+            new_epoch, old_playback, retired = self._advance_epoch()
+            if not retired:
                 return False
-            new_epoch, old_playback = advanced
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -1640,10 +1641,9 @@ class DuplexSessionRunner:
             old_response_id = session.active_response_id
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, old_response_id, committed_ms)
-            advanced = self._advance_epoch()
-            if advanced is None:
+            new_epoch, old_playback, retired = self._advance_epoch()
+            if not retired:
                 return
-            new_epoch, old_playback = advanced
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -1661,10 +1661,9 @@ class DuplexSessionRunner:
             old_epoch = session.epoch
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, session.last_response_id, committed_ms)
-            advanced = self._advance_epoch()
-            if advanced is None:
+            new_epoch, old_playback, retired = self._advance_epoch()
+            if not retired:
                 return
-            new_epoch, old_playback = advanced
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -1683,10 +1682,9 @@ class DuplexSessionRunner:
             old_response_id = session.active_response_id
             committed_ms = session.playback.committed_ms
             helpers.commit_played_response_history(session, old_response_id, committed_ms)
-            advanced = self._advance_epoch()
-            if advanced is None:
+            new_epoch, old_playback, retired = self._advance_epoch()
+            if not retired:
                 return
-            new_epoch, old_playback = advanced
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -1796,10 +1794,7 @@ class DuplexSessionRunner:
         older_abort_ids = [request_id for request_id in abort_ids if request_id not in cancelled_ids]
         if older_abort_ids:
             session.release_resources_for_request_ids(older_abort_ids)
-        advanced = self._advance_epoch()
-        if advanced is None:
-            return True
-        new_epoch, old_playback = advanced
+        new_epoch, old_playback, retired = self._advance_epoch()
         self.manager.invalidate_output(session.session_id, old_response_id, through_epoch=old_epoch)
         for response_id, _, _ in draining_cancels:
             self.manager.invalidate_output(session.session_id, response_id, through_epoch=old_epoch)
@@ -1819,7 +1814,7 @@ class DuplexSessionRunner:
             # asyncio.TimeoutError is not the builtin TimeoutError before Python 3.11.
             except (TimeoutError, asyncio.TimeoutError):
                 pass
-        if notify:
+        if notify and retired:
             self.emit(
                 {
                     "type": "audio.cancelled",
@@ -1860,7 +1855,8 @@ class DuplexSessionRunner:
     def _cancel_pending_input(self, *, reason: str) -> None:
         session = self.session
         cancelled = session.cancel_pending_input()
-        if self._advance_epoch() is None:
+        _, _, retired = self._advance_epoch()
+        if not retired:
             return
         self.emit(
             {
