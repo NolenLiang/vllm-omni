@@ -545,6 +545,36 @@ async def test_close_cancels_an_inflight_response_and_aborts_its_request() -> No
 
 
 @pytest.mark.asyncio
+async def test_close_skips_retirement_after_the_ledger_is_closed() -> None:
+    h = await open_harness()
+    try:
+        await h.run(append_audio())
+        request_id = h.stage0_request_id()
+        await h.deliver_and_settle(tts_output(request_id, samples=24000, text="hello"))
+        asked: list[str] = []
+
+        def explode(config, current):
+            del config, current
+            asked.append("retire")
+            raise RuntimeError("the plugin cannot prove its queue is clean")
+
+        h.runner.plugin.retire_pending_function_output = explode
+        await h.manager.handle(
+            CloseDuplexSessionMessage(control_id="c-close-retire", session_id=SESSION_ID, reason="client_close")
+        )
+        result = await asyncio.wait_for(h.results.get(), timeout=2.0)
+        events = await h.settle()
+
+        assert result.ok and result.operation == "close"
+        assert asked == []
+        assert "tool_result_retirement_failed" not in [getattr(event, "code", None) for event in events]
+        assert "session.closed" in types(events)
+        assert any(request_id in batch for batch in h.port.aborts)
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
 async def test_idle_expiry_emits_session_expired() -> None:
     clock = {"now": 100.0}
     h = await open_harness(runtime_config=DuplexSessionRuntimeConfig(idle_ttl_s=1.0), clock=lambda: clock["now"])

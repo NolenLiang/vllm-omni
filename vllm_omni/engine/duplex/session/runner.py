@@ -817,16 +817,20 @@ class DuplexSessionRunner:
 
         The bool is false only when this bump's retirement failed and closed
         the session. Callers still finish request teardown; they must not emit
-        a further ``audio.cancelled`` or ``input.cancelled``. A close that was
-        already in progress stays true, so its teardown is not skipped.
+        a further ``audio.cancelled`` or ``input.cancelled``. A close that had
+        already begun skips retirement and stays true: the ledger is already
+        closed, and a plugin error must not emit ``tool_result_retirement_failed``
+        ahead of the terminal event.
         """
         session = self.session
+        closing_before = self.run.closing
         old_epoch = session.epoch
         new_epoch, old_playback = helpers.advance_barge_in_epoch(session)
         retired = True
         if new_epoch != old_epoch:
             self.tool_calls.invalidate_epoch(new_epoch)
-            retired = self._retire_pending_function_output()
+            if not closing_before:
+                retired = self._retire_pending_function_output()
         return new_epoch, old_playback, retired
 
     def _retire_pending_function_output(self) -> bool:
