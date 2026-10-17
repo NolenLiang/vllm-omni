@@ -145,6 +145,9 @@ class _DeferredSilenceContinuation:
     expected_epoch: int | None
     expected_response_id: str | None
     expected_model_turn_id: int | None
+    # Real input can replace the append chain without changing these owners.
+    # A sleeper from the previous chain must leave the newer deferred slot alone.
+    append_tail: asyncio.Task[bool] | None
 
 
 _CANCEL_EVENTS = frozenset({"input.cancel", "response.cancel", "barge_in", "output_audio_buffer.clear"})
@@ -1484,8 +1487,9 @@ class DuplexSessionRunner:
         expected_epoch: int | None,
         expected_response_id: str | None,
         expected_model_turn_id: int | None,
+        append_tail: asyncio.Task[bool] | None,
     ) -> None:
-        """Drop a deferred continuation only when this caller owns it."""
+        """Drop only this owner's slot from the same append chain."""
         deferred = self._deferred_silence
         if deferred is None:
             return
@@ -1493,6 +1497,7 @@ class DuplexSessionRunner:
             deferred.expected_epoch == expected_epoch
             and deferred.expected_response_id == expected_response_id
             and deferred.expected_model_turn_id == expected_model_turn_id
+            and deferred.append_tail is append_tail
         ):
             self._deferred_silence = None
 
@@ -1502,6 +1507,7 @@ class DuplexSessionRunner:
         expected_epoch: int | None,
         expected_response_id: str | None,
         expected_model_turn_id: int | None,
+        append_tail: asyncio.Task[bool] | None,
     ) -> None:
         """Remember a continuation blocked only by audio that is not decoded yet."""
         if self._pending_input_appends <= 0:
@@ -1512,12 +1518,14 @@ class DuplexSessionRunner:
                 expected_epoch=expected_epoch,
                 expected_response_id=expected_response_id,
                 expected_model_turn_id=expected_model_turn_id,
+                append_tail=append_tail,
             )
             return
         self._deferred_silence = _DeferredSilenceContinuation(
             expected_epoch=expected_epoch,
             expected_response_id=expected_response_id,
             expected_model_turn_id=expected_model_turn_id,
+            append_tail=append_tail,
         )
 
     async def _rearm_deferred_silence(self) -> None:
@@ -1580,6 +1588,7 @@ class DuplexSessionRunner:
                 expected_epoch=expected_epoch,
                 expected_response_id=response_id,
                 expected_model_turn_id=expected_model_turn_id,
+                append_tail=append_tail,
             )
             return False
         chunk_period_s = max(0.0, float(session.capabilities.chunk_period_ms or 1000) / 1000.0)
@@ -1614,12 +1623,14 @@ class DuplexSessionRunner:
                     expected_epoch=expected_epoch,
                     expected_response_id=response_id,
                     expected_model_turn_id=expected_model_turn_id,
+                    append_tail=append_tail,
                 )
             else:
                 self._clear_deferred_silence_if_same(
                     expected_epoch=expected_epoch,
                     expected_response_id=response_id,
                     expected_model_turn_id=expected_model_turn_id,
+                    append_tail=append_tail,
                 )
             return False
 
