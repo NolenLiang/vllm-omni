@@ -66,12 +66,53 @@ def test_multi_request_projection_keeps_each_local_row():
         model_intermediate_buffer=[{"request_id": "one"}, {"request_id": "other"}],
         request_token_spans=[(0, 1), (1, 2)],
     )
-    assert "nvc_function_token" not in envelope.multimodal_outputs
+    tokens = envelope.multimodal_outputs["nvc_function_token"]
+    assert [int(token) for token in tokens] == [0, 1]
     for index, request_id in enumerate(["one", "other"]):
         output = thinker.postprocess(
             hidden[index : index + 1], request_id=request_id, multimodal_outputs=envelope.multimodal_outputs
         )
         assert int(output["nvc_prev_function_token"]) == index
+
+
+def test_intermediate_prefill_does_not_publish_or_consume_a_forced_token():
+    thinker = thinker_shell(forced=99)
+    hidden = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    info = {
+        "request_id": "one",
+        "_omni_is_prefill": True,
+        "_omni_num_computed_tokens": 0,
+        "_omni_prompt_len": 4,
+    }
+    envelope = thinker.make_omni_output(hidden, model_intermediate_buffer=[info], request_token_spans=[(0, 2)])
+    assert "nvc_function_token" not in envelope.multimodal_outputs
+    assert thinker._sessions["one"]["forced_function_token"] == 99
+
+    final_info = dict(info, _omni_num_computed_tokens=2)
+    final = thinker.make_omni_output(hidden, model_intermediate_buffer=[final_info], request_token_spans=[(0, 2)])
+    assert int(final.multimodal_outputs["nvc_function_token"]) == 99
+    assert thinker._sessions["one"]["forced_function_token"] == 99
+
+
+def test_mixed_prefill_keeps_the_other_requests_token():
+    thinker = thinker_shell()
+    hidden = torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+    envelope = thinker.make_omni_output(
+        hidden,
+        model_intermediate_buffer=[
+            {
+                "request_id": "one",
+                "_omni_is_prefill": True,
+                "_omni_num_computed_tokens": 0,
+                "_omni_prompt_len": 8,
+            },
+            {"request_id": "other"},
+        ],
+        request_token_spans=[(0, 1), (1, 2)],
+    )
+    tokens = envelope.multimodal_outputs["nvc_function_token"]
+    assert tokens[0].numel() == 0
+    assert int(tokens[1]) == 1
 
 
 def test_single_row_legacy_projection_is_unambiguous():

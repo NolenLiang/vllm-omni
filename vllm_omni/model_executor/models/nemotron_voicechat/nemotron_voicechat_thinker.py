@@ -406,6 +406,53 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 self._nvc_function_sampling_tokens = self.function_head(hidden_states.to(self._dtype)).argmax(dim=-1)
         return logits
 
+    def _client_function_tokens(
+        self,
+        model_outputs: torch.Tensor,
+        info_dicts: list[Any],
+        spans: object,
+    ) -> list[torch.Tensor | None]:
+        """Function token for each request, or None when this step must not publish one."""
+        row_count = int(model_outputs.shape[0])
+        aligned = isinstance(spans, (list, tuple)) and len(spans) == len(info_dicts)
+        tokens: list[torch.Tensor | None] = []
+        for index, info in enumerate(info_dicts):
+            span = self._validated_function_span(spans[index], row_count) if aligned else None
+            if span is None and spans is None and len(info_dicts) == 1 and row_count == 1:
+                start, end = 0, 1
+            elif span is None:
+                tokens.append(None)
+                continue
+            else:
+                start, end = span
+            if isinstance(info, dict) and info.get("_omni_is_prefill"):
+                computed = int(info.get("_omni_num_computed_tokens", 0) or 0)
+                prompt_len = int(info.get("_omni_prompt_len", 0) or 0)
+                if prompt_len and computed + (end - start) < prompt_len:
+                    tokens.append(None)
+                    continue
+            with torch.inference_mode():
+                function_token = self.function_head(model_outputs[end - 1 : end].to(self._dtype)).argmax(dim=-1)
+            request_id = info.get("request_id") if isinstance(info, dict) else None
+            session = self._sessions.get(request_id) if isinstance(request_id, str) else None
+            forced_token = session.get("forced_function_token") if isinstance(session, dict) else None
+            if isinstance(forced_token, int):
+                function_token = torch.full_like(function_token, forced_token)
+            tokens.append(function_token)
+        return tokens
+
+    @staticmethod
+    def _validated_function_span(span: object, row_count: int) -> tuple[int, int] | None:
+        if (
+            isinstance(span, (list, tuple))
+            and len(span) == 2
+            and type(span[0]) is int
+            and type(span[1]) is int
+            and 0 <= span[0] < span[1] <= row_count
+        ):
+            return span[0], span[1]
+        return None
+
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
@@ -426,40 +473,20 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 multimodal_outputs["nvc_function_response_consumed_generation"] = [
                     torch.tensor([generation], dtype=torch.int64) for generation in generations
                 ]
-        single_request = isinstance(info_dicts, list) and len(info_dicts) == 1
-        function_row = None
-        if self._use_function_head and model_outputs.numel() and single_request:
-            spans = kwargs.get("request_token_spans")
-            if spans is None:
-                # A single hidden row is unambiguous. Larger outputs may have
-                # trailing CUDA-graph padding; postprocess owns their fallback.
-                if int(model_outputs.shape[0]) == 1:
-                    function_row = 0
-            elif isinstance(spans, (list, tuple)) and len(spans) == 1:
-                span = spans[0]
-                if (
-                    isinstance(span, (list, tuple))
-                    and len(span) == 2
-                    and type(span[0]) is int
-                    and type(span[1]) is int
-                    and 0 <= span[0] < span[1] <= int(model_outputs.shape[0])
-                ):
-                    function_row = span[1] - 1
-        if function_row is not None:
-            # Only the request's scheduled tail belongs to this decision.
-            # Multiple requests and missing/invalid spans use postprocess's
-            # request-local slice instead of projecting a shared padded tail.
-            with torch.inference_mode():
-                function_token = self.function_head(
-                    model_outputs[function_row : function_row + 1].to(self._dtype)
-                ).argmax(dim=-1)
-            info = info_dicts[0]
-            request_id = info.get("request_id") if isinstance(info, dict) else None
-            session = self._sessions.get(request_id) if isinstance(request_id, str) else None
-            forced_token = session.get("forced_function_token") if isinstance(session, dict) else None
-            if isinstance(forced_token, int):
-                function_token = torch.full_like(function_token, forced_token)
-            multimodal_outputs["nvc_function_token"] = function_token
+        # One client token per request, taken from that request's scheduled
+        # tail. A shared padded tail would publish another request's decision,
+        # and omitting the key drops concurrent tool calls: the data plane
+        # reads only this output. An intermediate prefill chunk has not reached
+        # frame 0, so it publishes nothing and leaves a forced token queued.
+        if self._use_function_head and model_outputs.numel() and isinstance(info_dicts, list) and info_dicts:
+            function_tokens = self._client_function_tokens(model_outputs, info_dicts, kwargs.get("request_token_spans"))
+            if len(info_dicts) == 1:
+                if function_tokens[0] is not None:
+                    multimodal_outputs["nvc_function_token"] = function_tokens[0]
+            elif any(token is not None for token in function_tokens):
+                multimodal_outputs["nvc_function_token"] = [
+                    token if token is not None else torch.empty(0, dtype=torch.int64) for token in function_tokens
+                ]
         return OmniOutput(
             text_hidden_states=model_outputs,
             multimodal_outputs=multimodal_outputs,
@@ -1059,9 +1086,9 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                     queue = session.get("forced_function_tokens")
                     if not isinstance(queue, list) or not queue or queue.pop(0) != forced:
                         raise RuntimeError("Nemotron VoiceChat forced function-token queue lost alignment")
-                    # Apply the override here too: with several concurrent
-                    # requests make_omni_output omits the shared token, so the
-                    # token above is this request's own computed one.
+                    # The client list is per request, but this hook receives the
+                    # whole batch output. Recompute from this request's hidden
+                    # slice, then apply the same override the client token used.
                     token = torch.full_like(token, forced)
                 # StreamingUpdate replaces the runner payload at each append;
                 # retain the function channel in model-owned session state.
