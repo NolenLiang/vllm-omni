@@ -133,6 +133,20 @@ class _Internal:
     payload: dict[str, object] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class _DeferredSilenceContinuation:
+    """A continuation that lost the race to audio still awaiting decode.
+
+    Replay it only if that audio settles without a submission. The fences are
+    the ones ``maybe_continue_response`` already checks, so a barge-in or a
+    finished response drops the replay instead of appending into a new turn.
+    """
+
+    expected_epoch: int | None
+    expected_response_id: str | None
+    expected_model_turn_id: int | None
+
+
 _CANCEL_EVENTS = frozenset({"input.cancel", "response.cancel", "barge_in", "output_audio_buffer.clear"})
 
 
@@ -194,6 +208,10 @@ class DuplexSessionRunner:
         # too, even before it reaches the PCM buffer. Continuations must not
         # insert a synthetic frame ahead of that already-received audio.
         self._pending_input_appends = 0
+        # Set when a continuation bails because of that counter, and replayed
+        # only if the append then submits nothing (overlap drop / ack /
+        # continue_output). A real submission clears it.
+        self._deferred_silence: _DeferredSilenceContinuation | None = None
         self._worker: asyncio.Task[None] | None = None
         self._worker_stopped = False
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -517,6 +535,8 @@ class DuplexSessionRunner:
             finally:
                 if isinstance(item, AppendAudio):
                     self._pending_input_appends -= 1
+                    if self._pending_input_appends == 0 and self._deferred_silence is not None:
+                        self.spawn(self._rearm_deferred_silence(), name="duplex-continue")
 
     async def _stop_worker(self) -> None:
         worker = self._worker
@@ -1346,6 +1366,9 @@ class DuplexSessionRunner:
         session = self.session
         model_state = self.model_state
         if not silence_continuation:
+            # This append is being admitted. Do not also replay a continuation
+            # that was waiting to see whether the same audio would be dropped.
+            self._deferred_silence = None
             self._mark_pending_silence_superseded()
             if on_append_accepted is None:
                 # A real (non-silence) input re-anchors the silence pacing
@@ -1455,6 +1478,42 @@ class DuplexSessionRunner:
         except Exception:
             return False
 
+    def _defer_silence_continuation(
+        self,
+        *,
+        expected_epoch: int | None,
+        expected_response_id: str | None,
+        expected_model_turn_id: int | None,
+    ) -> None:
+        """Remember a continuation blocked only by audio that is not decoded yet."""
+        if self._pending_input_appends <= 0:
+            # PCM is already buffered. Replaying when that audio drains would
+            # put silence ahead of it.
+            self._deferred_silence = None
+            return
+        self._deferred_silence = _DeferredSilenceContinuation(
+            expected_epoch=expected_epoch,
+            expected_response_id=expected_response_id,
+            expected_model_turn_id=expected_model_turn_id,
+        )
+
+    async def _rearm_deferred_silence(self) -> None:
+        """Replay one blocked continuation after an append submitted nothing."""
+        deferred = self._deferred_silence
+        if deferred is None or self.run.closing:
+            return
+        buffer = self.model_state.audio_buffer
+        if self._pending_input_appends > 0 and not (buffer.has_pending() or buffer.has_reserved()):
+            return
+        self._deferred_silence = None
+        if self._real_input_waiting() or self.session.state != DuplexSessionState.OPEN:
+            return
+        await self.model.maybe_continue_response(
+            expected_epoch=deferred.expected_epoch,
+            expected_model_turn_id=deferred.expected_model_turn_id,
+            expected_response_id=deferred.expected_response_id,
+        )
+
     async def _schedule_silence_continuation(
         self,
         payload: object,
@@ -1488,6 +1547,11 @@ class DuplexSessionRunner:
                 return False
         append_tail = self.tasks.append_tail
         if (append_tail is None or append_tail.done()) and self._real_input_waiting():
+            self._defer_silence_continuation(
+                expected_epoch=expected_epoch,
+                expected_response_id=response_id,
+                expected_model_turn_id=expected_model_turn_id,
+            )
             return False
         chunk_period_s = max(0.0, float(session.capabilities.chunk_period_ms or 1000) / 1000.0)
         # Snapshot the anchor after any wait for pending silence. A real append
@@ -1506,17 +1570,24 @@ class DuplexSessionRunner:
         )
         if delay_s > 0:
             await asyncio.sleep(delay_s)
-        if (
-            self.tasks.append_tail is not append_tail
-            or ((append_tail is None or append_tail.done()) and self._real_input_waiting())
-            or self.model.silence_continuation_is_stale(
-                request_id=request_id,
-                response_id=response_id,
-                response_owned=response_owned,
-                expected_epoch=expected_epoch,
-                expected_model_turn_id=expected_model_turn_id,
-            )
-        ):
+        waiting_for_input = (append_tail is None or append_tail.done()) and self._real_input_waiting()
+        tail_moved = self.tasks.append_tail is not append_tail
+        stale = self.model.silence_continuation_is_stale(
+            request_id=request_id,
+            response_id=response_id,
+            response_owned=response_owned,
+            expected_epoch=expected_epoch,
+            expected_model_turn_id=expected_model_turn_id,
+        )
+        if tail_moved or waiting_for_input or stale:
+            if waiting_for_input and not tail_moved and not stale:
+                self._defer_silence_continuation(
+                    expected_epoch=expected_epoch,
+                    expected_response_id=response_id,
+                    expected_model_turn_id=expected_model_turn_id,
+                )
+            else:
+                self._deferred_silence = None
             return False
 
         def _still_valid() -> bool:

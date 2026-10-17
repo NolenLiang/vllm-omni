@@ -4,6 +4,8 @@
 """Received audio must win over silence before PCM buffering, too."""
 
 import asyncio
+import base64
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -11,6 +13,7 @@ import pytest
 from tests.engine.duplex.test_session_runner import append_audio, types
 from tests.engine.duplex.test_session_runner_nemotron_voicechat import open_nemotron_harness
 from vllm_omni.engine.duplex import commands
+from vllm_omni.engine.duplex.config import DuplexOverlapPolicy
 from vllm_omni.engine.duplex.session import model_channel as model_channel_module
 from vllm_omni.engine.duplex.session import runner as runner_module
 
@@ -118,3 +121,70 @@ async def test_rejected_audio_releases_silence_priority(monkeypatch, failure):
         assert await schedule_silence(h) is True
         assert await h.runner.tasks.append_tail
         assert len(h.port.submissions) == 2
+
+
+def _pcm_bytes(payload: dict[str, object]) -> bytes:
+    audio = payload["audio"]
+    if isinstance(audio, str):
+        return base64.b64decode(audio)
+    if isinstance(audio, bytes):
+        return audio
+    raise AssertionError(type(audio))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("overlap_action", ["continue_output", "ack", "drop"])
+async def test_ignored_overlap_frame_rearms_the_blocked_continuation(monkeypatch, overlap_action):
+    """A valid frame that overlap discards must not swallow the only continuation.
+
+    The continuation runs while the frame is still decoding, sees the pending
+    counter, and returns. After the frame is ignored there is no second client
+    input and no manual reschedule; the same epoch and response must still
+    gain exactly one silence unit.
+    """
+    async with open_nemotron_harness(monkeypatch) as h:
+        await h.run(append_audio(samples=1280))
+        activate_response(h, monkeypatch)
+        # MiniCPM-o shape: auto-response is already on, and barge-in-on-speech
+        # is what keeps overlap active for continue_output / ack / drop.
+        h.session.capabilities = replace(h.session.capabilities, supports_barge_in=True)
+        h.session.config.overlap_policy = DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
+        received = append_audio(samples=1280)
+        ignored = commands.AppendAudio(
+            audio=received.audio,
+            format=received.format,
+            sample_rate_hz=received.sample_rate_hz,
+            is_speech=True,
+            hints={"overlap_action": overlap_action},
+        )
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = h.runner.offload
+
+        async def gated_decode(fn, *args, **kwargs):
+            if fn is runner_module.convert_input_audio_with_rate:
+                entered.set()
+                await release.wait()
+            return await original(fn, *args, **kwargs)
+
+        monkeypatch.setattr(h.runner, "offload", gated_decode)
+        response_id = h.session.active_response_id
+        epoch = h.session.epoch
+        h.submit(ignored)
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        try:
+            await h.runner.model.maybe_continue_response(
+                expected_epoch=epoch,
+                expected_response_id=response_id,
+            )
+            assert len(h.port.submissions) == 1
+            assert h.runner.model_state.continuation_units == 0
+        finally:
+            release.set()
+        await h.settle()
+        assert h.session.epoch == epoch
+        assert h.session.active_response_id == response_id
+        assert len(h.port.submissions) == 2
+        assert h.runner.model_state.continuation_units == 1
+        silence = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
+        assert silence["epoch"] == epoch
+        assert set(_pcm_bytes(silence["payload"])) == {0}
