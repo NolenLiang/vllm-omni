@@ -1478,6 +1478,24 @@ class DuplexSessionRunner:
         except Exception:
             return False
 
+    def _clear_deferred_silence_if_same(
+        self,
+        *,
+        expected_epoch: int | None,
+        expected_response_id: str | None,
+        expected_model_turn_id: int | None,
+    ) -> None:
+        """Drop a deferred continuation only when this caller owns it."""
+        deferred = self._deferred_silence
+        if deferred is None:
+            return
+        if (
+            deferred.expected_epoch == expected_epoch
+            and deferred.expected_response_id == expected_response_id
+            and deferred.expected_model_turn_id == expected_model_turn_id
+        ):
+            self._deferred_silence = None
+
     def _defer_silence_continuation(
         self,
         *,
@@ -1488,8 +1506,13 @@ class DuplexSessionRunner:
         """Remember a continuation blocked only by audio that is not decoded yet."""
         if self._pending_input_appends <= 0:
             # PCM is already buffered. Replaying when that audio drains would
-            # put silence ahead of it.
-            self._deferred_silence = None
+            # put silence ahead of it. Only this continuation's own slot is
+            # dropped; another owner may still be waiting on audio in flight.
+            self._clear_deferred_silence_if_same(
+                expected_epoch=expected_epoch,
+                expected_response_id=expected_response_id,
+                expected_model_turn_id=expected_model_turn_id,
+            )
             return
         self._deferred_silence = _DeferredSilenceContinuation(
             expected_epoch=expected_epoch,
@@ -1504,6 +1527,12 @@ class DuplexSessionRunner:
             return
         buffer = self.model_state.audio_buffer
         if self._pending_input_appends > 0 and not (buffer.has_pending() or buffer.has_reserved()):
+            return
+        # A model-turn continuation stored no response id. A response that
+        # began since then (queued stage output can begin_response before this
+        # replay runs) must keep its own chain.
+        if deferred.expected_response_id is None and self.session.active_response_id is not None:
+            self._deferred_silence = None
             return
         self._deferred_silence = None
         if self._real_input_waiting() or self.session.state != DuplexSessionState.OPEN:
@@ -1587,7 +1616,11 @@ class DuplexSessionRunner:
                     expected_model_turn_id=expected_model_turn_id,
                 )
             else:
-                self._deferred_silence = None
+                self._clear_deferred_silence_if_same(
+                    expected_epoch=expected_epoch,
+                    expected_response_id=response_id,
+                    expected_model_turn_id=expected_model_turn_id,
+                )
             return False
 
         def _still_valid() -> bool:

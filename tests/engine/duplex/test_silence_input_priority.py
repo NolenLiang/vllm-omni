@@ -188,3 +188,150 @@ async def test_ignored_overlap_frame_rearms_the_blocked_continuation(monkeypatch
         silence = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
         assert silence["epoch"] == epoch
         assert set(_pcm_bytes(silence["payload"])) == {0}
+
+
+def enable_overlap_discard(h) -> None:
+    h.session.capabilities = replace(h.session.capabilities, supports_barge_in=True)
+    h.session.config.overlap_policy = DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
+
+
+def ignored_append(overlap_action: str) -> commands.AppendAudio:
+    received = append_audio(samples=1280)
+    return commands.AppendAudio(
+        audio=received.audio,
+        format=received.format,
+        sample_rate_hz=received.sample_rate_hz,
+        is_speech=True,
+        hints={"overlap_action": overlap_action},
+    )
+
+
+@pytest.mark.asyncio
+async def test_stale_sleeper_keeps_another_owners_deferred_continuation(monkeypatch):
+    """An older pacing sleep must not clear a slot another continuation just stored."""
+    async with open_nemotron_harness(monkeypatch) as h:
+        await h.run(append_audio(samples=1280))
+        activate_response(h, monkeypatch)
+        enable_overlap_discard(h)
+        # The deadline is not yet due, so the older continuation blocks in sleep.
+        clock = SimpleNamespace(monotonic=lambda: 100.0)
+        monkeypatch.setattr(runner_module, "time", clock)
+        monkeypatch.setattr(model_channel_module, "time", clock)
+        h.runner.model_state.last_native_submit_monotonic = 100.0
+        h.runner.model_state.silence_deadline_monotonic = None
+        entered_sleep, release_sleep = asyncio.Event(), asyncio.Event()
+        entered_decode, release_decode = asyncio.Event(), asyncio.Event()
+        slept = False
+        real_sleep = runner_module.asyncio.sleep
+
+        async def gated_sleep(delay, *args, **kwargs):
+            nonlocal slept
+            if delay > 0 and not slept:
+                slept = True
+                entered_sleep.set()
+                await release_sleep.wait()
+                return None
+            return await real_sleep(delay, *args, **kwargs)
+
+        monkeypatch.setattr(runner_module.asyncio, "sleep", gated_sleep)
+        original = h.runner.offload
+
+        async def gated_decode(fn, *args, **kwargs):
+            if fn is runner_module.convert_input_audio_with_rate:
+                entered_decode.set()
+                await release_decode.wait()
+            return await original(fn, *args, **kwargs)
+
+        monkeypatch.setattr(h.runner, "offload", gated_decode)
+        response_id = h.session.active_response_id
+        old_epoch = h.session.epoch
+        older = asyncio.create_task(
+            h.runner.model.maybe_continue_response(
+                expected_epoch=old_epoch,
+                expected_response_id=response_id,
+            )
+        )
+        await asyncio.wait_for(entered_sleep.wait(), timeout=2)
+        h.session.epoch = old_epoch + 1
+        h.submit(ignored_append("drop"))
+        await asyncio.wait_for(entered_decode.wait(), timeout=2)
+        try:
+            await h.runner.model.maybe_continue_response(
+                expected_epoch=h.session.epoch,
+                expected_response_id=response_id,
+            )
+            deferred = h.runner._deferred_silence
+            assert deferred is not None
+            assert deferred.expected_epoch == h.session.epoch
+            assert deferred.expected_response_id == response_id
+            release_sleep.set()
+            await older
+            assert h.runner._deferred_silence is deferred
+            assert len(h.port.submissions) == 1
+        finally:
+            release_sleep.set()
+            release_decode.set()
+        await h.settle()
+        assert h.session.active_response_id == response_id
+        assert len(h.port.submissions) == 2
+        assert h.runner.model_state.continuation_units == 1
+        silence = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
+        assert silence["epoch"] == old_epoch + 1
+        assert set(_pcm_bytes(silence["payload"])) == {0}
+
+
+@pytest.mark.asyncio
+async def test_model_turn_replay_skips_a_response_begun_from_queued_output(monkeypatch):
+    """A deferred model-turn continuation must not feed a response begun later."""
+    async with open_nemotron_harness(monkeypatch) as h:
+        await h.run(append_audio(samples=1280))
+        activate_response(h, monkeypatch)
+        h.session.mark_audio_sent(duration_ms=80)
+        h.session.end_response(commit_text=False, preserve_request=True)
+        assert h.session.active_response_id is None
+        assert isinstance(h.session.active_request_id, str)
+        # Playback keeps overlap active without an open response, so the frame
+        # can be discarded while the continuation is still model-turn owned.
+        assert h.session.playback.sent_ms > h.session.playback.committed_ms
+        enable_overlap_discard(h)
+        entered, release = asyncio.Event(), asyncio.Event()
+        original = h.runner.offload
+
+        async def gated_decode(fn, *args, **kwargs):
+            if fn is runner_module.convert_input_audio_with_rate:
+                entered.set()
+                await release.wait()
+            return await original(fn, *args, **kwargs)
+
+        monkeypatch.setattr(h.runner, "offload", gated_decode)
+        epoch = h.session.epoch
+        turn_id = h.session.turn_id
+        h.submit(ignored_append("continue_output"))
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        try:
+            await h.runner.model.maybe_continue_response(
+                expected_epoch=epoch,
+                expected_model_turn_id=turn_id,
+            )
+            deferred = h.runner._deferred_silence
+            assert deferred is not None
+            assert deferred.expected_response_id is None
+            assert deferred.expected_model_turn_id == turn_id
+            h.deliver(
+                SimpleNamespace(
+                    request_id=h.stage0_request_id(),
+                    finished=False,
+                    multimodal_output={},
+                    outputs=[SimpleNamespace(text="", token_ids=[42], multimodal_output={})],
+                ),
+                stage_id=0,
+                segment_finished=True,
+                segment_token_ids=[42],
+            )
+            assert len(h.port.submissions) == 1
+        finally:
+            release.set()
+        await h.settle()
+        assert h.session.active_response_id is not None
+        assert len(h.port.submissions) == 1
+        assert h.runner.model_state.continuation_units == 0
