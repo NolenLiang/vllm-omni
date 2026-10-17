@@ -431,3 +431,55 @@ async def test_old_append_tail_keeps_same_owners_new_deferred_continuation(monke
         silence = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
         assert silence["epoch"] == epoch
         assert set(_pcm_bytes(silence["payload"])) == {0}
+
+
+def _due_silence_clock(h, monkeypatch):
+    now = {"value": 100.0}
+    clock = SimpleNamespace(monotonic=lambda: now["value"])
+    monkeypatch.setattr(runner_module, "time", clock)
+    monkeypatch.setattr(model_channel_module, "time", clock)
+    h.runner.model_state.last_native_submit_monotonic = 100.0
+    h.runner.model_state.silence_deadline_monotonic = None
+    return now
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("move_tail", [False, True])
+async def test_unset_append_tail_cannot_drop_a_newer_deferred_slot(monkeypatch, move_tail):
+    """None is not a chain id. An older sleeper must not clear or replace the newer slot."""
+    async with open_nemotron_harness(monkeypatch) as h:
+        await h.run(append_audio(samples=1280))
+        activate_response(h, monkeypatch)
+        h.runner.tasks.append_tail = None
+        _due_silence_clock(h, monkeypatch)
+        entered_sleep, release_sleep = asyncio.Event(), asyncio.Event()
+        real_sleep = asyncio.sleep
+        slept = False
+
+        async def gated_sleep(delay, *args, **kwargs):
+            nonlocal slept
+            if delay > 0 and not slept:
+                slept = True
+                entered_sleep.set()
+                await release_sleep.wait()
+                return None
+            return await real_sleep(delay, *args, **kwargs)
+
+        monkeypatch.setattr(runner_module.asyncio, "sleep", gated_sleep)
+        older = asyncio.create_task(schedule_silence(h))
+        try:
+            await asyncio.wait_for(entered_sleep.wait(), timeout=2)
+            h.runner._pending_input_appends = 1
+            assert await schedule_silence(h) is False
+            deferred = h.runner._deferred_silence
+            assert deferred is not None
+            assert deferred.append_tail is None
+            if move_tail:
+                h.runner.tasks.append_tail = asyncio.create_task(real_sleep(0))
+            release_sleep.set()
+            assert await older is False
+            assert h.runner._deferred_silence is deferred
+        finally:
+            release_sleep.set()
+            h.runner._pending_input_appends = 0
+            await asyncio.gather(older, return_exceptions=True)

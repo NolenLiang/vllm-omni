@@ -148,6 +148,10 @@ class _DeferredSilenceContinuation:
     # Real input can replace the append chain without changing these owners.
     # A sleeper from the previous chain must leave the newer deferred slot alone.
     append_tail: asyncio.Task[bool] | None
+    # ``None`` and an already-finished task are not unique chain ids. This
+    # increases every time a continuation stores the slot, so an older sleeper
+    # cannot clear or replace one stored while it was waiting.
+    defer_generation: int
 
 
 _CANCEL_EVENTS = frozenset({"input.cancel", "response.cancel", "barge_in", "output_audio_buffer.clear"})
@@ -215,6 +219,7 @@ class DuplexSessionRunner:
         # only if the append then submits nothing (overlap drop / ack /
         # continue_output). A real submission clears it.
         self._deferred_silence: _DeferredSilenceContinuation | None = None
+        self._silence_defer_generation = 0
         self._worker: asyncio.Task[None] | None = None
         self._worker_stopped = False
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -1501,6 +1506,10 @@ class DuplexSessionRunner:
         ):
             self._deferred_silence = None
 
+    def _deferred_silence_is_newer(self, seen_generation: int) -> bool:
+        deferred = self._deferred_silence
+        return deferred is not None and deferred.defer_generation > seen_generation
+
     def _defer_silence_continuation(
         self,
         *,
@@ -1508,8 +1517,11 @@ class DuplexSessionRunner:
         expected_response_id: str | None,
         expected_model_turn_id: int | None,
         append_tail: asyncio.Task[bool] | None,
+        seen_generation: int,
     ) -> None:
         """Remember a continuation blocked only by audio that is not decoded yet."""
+        if self._deferred_silence_is_newer(seen_generation):
+            return
         if self._pending_input_appends <= 0:
             # PCM is already buffered. Replaying when that audio drains would
             # put silence ahead of it. Only this continuation's own slot is
@@ -1521,11 +1533,13 @@ class DuplexSessionRunner:
                 append_tail=append_tail,
             )
             return
+        self._silence_defer_generation += 1
         self._deferred_silence = _DeferredSilenceContinuation(
             expected_epoch=expected_epoch,
             expected_response_id=expected_response_id,
             expected_model_turn_id=expected_model_turn_id,
             append_tail=append_tail,
+            defer_generation=self._silence_defer_generation,
         )
 
     async def _rearm_deferred_silence(self) -> None:
@@ -1564,6 +1578,10 @@ class DuplexSessionRunner:
     ) -> bool:
         session = self.session
         model_state = self.model_state
+        # Captured before every await. A continuation that stores the slot
+        # while this one waits is newer, even when both saw append_tail None
+        # or the same already-finished task.
+        seen_generation = self._silence_defer_generation
         self._clear_completed_pending_silence()
         pending_silence = model_state.pending_silence_task
         if pending_silence is not None and not pending_silence.done():
@@ -1589,6 +1607,7 @@ class DuplexSessionRunner:
                 expected_response_id=response_id,
                 expected_model_turn_id=expected_model_turn_id,
                 append_tail=append_tail,
+                seen_generation=seen_generation,
             )
             return False
         chunk_period_s = max(0.0, float(session.capabilities.chunk_period_ms or 1000) / 1000.0)
@@ -1624,8 +1643,9 @@ class DuplexSessionRunner:
                     expected_response_id=response_id,
                     expected_model_turn_id=expected_model_turn_id,
                     append_tail=append_tail,
+                    seen_generation=seen_generation,
                 )
-            else:
+            elif not self._deferred_silence_is_newer(seen_generation):
                 self._clear_deferred_silence_if_same(
                     expected_epoch=expected_epoch,
                     expected_response_id=response_id,
