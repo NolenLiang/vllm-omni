@@ -348,6 +348,7 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         self._sessions: dict[str, dict[str, Any]] = {}
         self._duplex_sampling_rows: dict[int, str] = {}
         self._duplex_previous_text_tokens: dict[str, int] = {}
+        self._nvc_function_sampling_tokens: torch.Tensor | None = None
 
     # ------------------------------------------------------------------
     # Special token ids (from the checkpoint's token strings).
@@ -397,8 +398,13 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
     def compute_logits(self, hidden_states: torch.Tensor | OmniOutput, sampling_metadata: Any = None) -> torch.Tensor:
         if isinstance(hidden_states, OmniOutput):
             hidden_states = hidden_states.text_hidden_states
-        # vLLM >= 0.25 dropped the sampling_metadata parameter.
-        return self.language_model.compute_logits(hidden_states)
+        # These are the selected sampling rows, not the padded forward output.
+        self._nvc_function_sampling_tokens = None
+        logits = self.language_model.compute_logits(hidden_states)
+        if self._use_function_head and hidden_states.numel():
+            with torch.inference_mode():
+                self._nvc_function_sampling_tokens = self.function_head(hidden_states.to(self._dtype)).argmax(dim=-1)
+        return logits
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput, **kwargs: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
@@ -475,6 +481,10 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
     ) -> SamplerOutput | None:
         del sampling_metadata
         rows = self._duplex_sampling_rows
+        functions = self._nvc_function_sampling_tokens
+        # Do not let a fallback or a failed batch leak decisions into another.
+        self._duplex_sampling_rows = {}
+        self._nvc_function_sampling_tokens = None
         if not rows:
             return None
         expected_rows = set(range(int(logits.shape[0])))
@@ -483,11 +493,40 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 "NemotronVoiceChat native-duplex sampling requires every active batch row "
                 "to be a duplex request; mixed duplex/non-duplex batches are unsupported."
             )
-        sampled = logits.argmax(dim=-1).to(dtype=torch.int32)
+        if len(set(rows.values())) != len(rows):
+            raise RuntimeError("NemotronVoiceChat native sampling requires one row per request")
+        function_tokens: list[int] | None = None
+        if self._use_function_head:
+            if not isinstance(functions, torch.Tensor) or functions.shape != (len(rows),):
+                raise RuntimeError("NemotronVoiceChat function decisions do not match the current sampling rows")
+            # Transfer the small batch together instead of synchronizing per row.
+            function_tokens = functions.tolist()
+        decisions = []
         for row_idx, request_id in rows.items():
             session = self._sessions.get(request_id)
-            if isinstance(session, dict) and isinstance(session.get("forced_function_token"), int):
-                sampled[row_idx] = int(session["nvc_text_pad_id"])
+            if not isinstance(session, dict):
+                raise RuntimeError("NemotronVoiceChat native sampling has no request state")
+            if not session.get("sampling_frame_eligible", True):
+                # vLLM samples partial prefill rows before discarding them.
+                # They have no acoustic-frame decision to commit here.
+                continue
+            pad_id = int(session["nvc_text_pad_id"])
+            active = self._use_function_head and bool(session.get("function_call_active", False))
+            forced = self._use_function_head and isinstance(session.get("forced_function_token"), int)
+            if function_tokens is not None and not forced:
+                function_token = function_tokens[row_idx]
+                if function_token == int(session["nvc_function_sotc_id"]):
+                    active = True
+                elif function_token == int(session["nvc_function_eotc_id"]):
+                    active = False
+            decisions.append((row_idx, request_id, session, active, forced, pad_id))
+        # All rows are validated before committing any request's policy state.
+        sampled = logits.argmax(dim=-1).to(dtype=torch.int32)
+        for row_idx, request_id, session, active, forced, pad_id in decisions:
+            if active or forced:
+                sampled[row_idx] = pad_id
+            session["function_call_active"] = active
+            # PAD must also reach the next frame's text fusion, not just the wire.
             self._duplex_previous_text_tokens[request_id] = int(sampled[row_idx].item())
         return SamplerOutput(
             sampled_token_ids=sampled.unsqueeze(-1),
@@ -668,6 +707,14 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
 
         session = self._sessions.get(request_id)
         if session is None:
+            sotc_id: int | None = None
+            eotc_id: int | None = None
+            if self._use_function_head:
+                try:
+                    sotc_id = int(runtime_config["nvc_function_sotc_id"])
+                    eotc_id = int(runtime_config["nvc_function_eotc_id"])
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise ValueError("Nemotron VoiceChat function boundary metadata is incomplete") from exc
             prompt_ids_raw = runtime_config.get("nvc_prompt_token_ids")
             if not isinstance(prompt_ids_raw, list | tuple) or not prompt_ids_raw:
                 raise ValueError("Nemotron VoiceChat duplex runtime requires nvc_prompt_token_ids")
@@ -681,6 +728,9 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                 "func_token": pad_id,
                 "last_input_seq": 0,
                 "nvc_text_pad_id": pad_id,
+                "nvc_function_sotc_id": sotc_id,
+                "nvc_function_eotc_id": eotc_id,
+                "function_call_active": False,
                 "function_response_generation": 0,
                 "forced_function_tokens": [],
             }
@@ -700,12 +750,14 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         else:
             frame = self._duplex_stable_frame(session, duplex, device)
 
-        self._sync_forced_function_response(session, runtime_config)
+        if self._use_function_head:
+            self._sync_forced_function_response(session, runtime_config)
 
         offset = max(0, int(info.get("_omni_num_computed_tokens", 0) or 0))
         span = int(input_ids.shape[0])
         prefill = session["prefill_embeds"]
         if offset + span <= int(prefill.shape[0]):
+            session["sampling_frame_eligible"] = offset + span == int(prefill.shape[0])
             # Engine positions inside the fused prompt prefill (possibly
             # chunked).  The position decides, not the duplex input sequence:
             # after a mid-stream session reset the re-opened request prefills
@@ -720,6 +772,7 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
 
         if int(input_ids.shape[0]) != 1:
             raise ValueError("Nemotron VoiceChat duplex continuation must schedule exactly one frame token")
+        session["sampling_frame_eligible"] = True
         previous_function = info.get("nvc_prev_function_token")
         if previous_function is not None:
             if isinstance(previous_function, torch.Tensor):
