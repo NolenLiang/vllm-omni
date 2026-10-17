@@ -421,13 +421,32 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                     torch.tensor([generation], dtype=torch.int64) for generation in generations
                 ]
         single_request = isinstance(info_dicts, list) and len(info_dicts) == 1
+        function_row = None
         if self._use_function_head and model_outputs.numel() and single_request:
-            # Only a single-request batch can attribute the batch's last row
-            # to a request.  With several concurrent requests this key is
-            # omitted and postprocess computes each request's token from its
-            # own hidden-state slice instead (and applies any forced token).
+            spans = kwargs.get("request_token_spans")
+            if spans is None:
+                # A single hidden row is unambiguous. Larger outputs may have
+                # trailing CUDA-graph padding; postprocess owns their fallback.
+                if int(model_outputs.shape[0]) == 1:
+                    function_row = 0
+            elif isinstance(spans, (list, tuple)) and len(spans) == 1:
+                span = spans[0]
+                if (
+                    isinstance(span, (list, tuple))
+                    and len(span) == 2
+                    and type(span[0]) is int
+                    and type(span[1]) is int
+                    and 0 <= span[0] < span[1] <= int(model_outputs.shape[0])
+                ):
+                    function_row = span[1] - 1
+        if function_row is not None:
+            # Only the request's scheduled tail belongs to this decision.
+            # Multiple requests and missing/invalid spans use postprocess's
+            # request-local slice instead of projecting a shared padded tail.
             with torch.inference_mode():
-                function_token = self.function_head(model_outputs[-1:, :].to(self._dtype)).argmax(dim=-1)
+                function_token = self.function_head(
+                    model_outputs[function_row : function_row + 1].to(self._dtype)
+                ).argmax(dim=-1)
             info = info_dicts[0]
             request_id = info.get("request_id") if isinstance(info, dict) else None
             session = self._sessions.get(request_id) if isinstance(request_id, str) else None
