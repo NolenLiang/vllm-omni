@@ -704,7 +704,7 @@ class Qwen3OmniDuplexPlugin(DuplexModelPlugin):
             return None
         if not isinstance(arguments, str):
             try:
-                arguments = json.dumps(arguments, ensure_ascii=False)
+                arguments = json.dumps(arguments, ensure_ascii=False, allow_nan=False)
             except (TypeError, ValueError):
                 # Same shape as an invalid tool tag: the session rejects the
                 # call instead of publishing ``str(arguments)`` as JSON.

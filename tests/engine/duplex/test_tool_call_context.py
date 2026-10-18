@@ -37,10 +37,10 @@ async def test_plugin_gets_trusted_context_without_changing_native_candidate_or_
         seen = []
         real_convert = h.runner.plugin.runtime_config_for_function_output
 
-        def convert(config, current, prepared):
+        def convert(config, current, prepared, **kwargs):
             seen.append(deepcopy(prepared))
-            expected_native_candidate = real_convert(config, deepcopy(current), submitted)
-            candidate = real_convert(config, current, prepared)
+            expected_native_candidate = real_convert(config, deepcopy(current), submitted, **kwargs)
+            candidate = real_convert(config, current, prepared, **kwargs)
             assert candidate == expected_native_candidate
             # A plugin's writes to its preparation copy must not rewrite the
             # client's item or the acceptance acknowledgement, even nested data.
@@ -68,11 +68,11 @@ async def test_retry_uses_same_origin_despite_changing_client_hints(monkeypatch)
         seen = []
         real_convert = h.runner.plugin.runtime_config_for_function_output
 
-        def convert(config, current, prepared):
+        def convert(config, current, prepared, **kwargs):
             seen.append((prepared.get("name"), prepared.get("arguments")))
             if len(seen) == 1:
                 raise DuplexRuntimeConfigError("probe refuses the first preparation", code="prepare_refused")
-            return real_convert(config, current, prepared)
+            return real_convert(config, current, prepared, **kwargs)
 
         monkeypatch.setattr(h.runner.plugin, "runtime_config_for_function_output", convert)
         refused = await h.run(
@@ -104,9 +104,9 @@ async def test_metadata_less_origin_never_falls_back_to_client_hints(monkeypatch
         seen = []
         real_convert = h.runner.plugin.runtime_config_for_function_output
 
-        def convert(config, current, prepared):
+        def convert(config, current, prepared, **kwargs):
             seen.append(dict(prepared))
-            return real_convert(config, current, prepared)
+            return real_convert(config, current, prepared, **kwargs)
 
         monkeypatch.setattr(h.runner.plugin, "runtime_config_for_function_output", convert)
         assert error_codes(await answer(h, call_id, name="forged_name", arguments="{}")) == []
@@ -129,7 +129,8 @@ async def test_missing_context_refusals_preserve_the_original_deadline(monkeypat
         )
         original_deadline = call.deadline
 
-        def require_context(config, current, prepared):
+        def require_context(config, current, prepared, **kwargs):
+            del kwargs
             assert "name" not in prepared and "arguments" not in prepared
             raise DuplexRuntimeConfigError("session-owned metadata is required", code="missing_call_context")
 

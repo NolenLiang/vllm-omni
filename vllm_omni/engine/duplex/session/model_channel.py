@@ -86,7 +86,7 @@ def _coerce_function_call(raw: object) -> dict[str, str] | None:
         return None
     if not isinstance(arguments, str):
         try:
-            arguments = json.dumps(arguments, ensure_ascii=False)
+            arguments = json.dumps(arguments, ensure_ascii=False, allow_nan=False)
         except (TypeError, ValueError):
             return None
     return {"call_id": call_id, "name": name, "arguments": arguments}
@@ -1012,11 +1012,8 @@ class ModelChannel:
             return
         arguments = function_call.get("arguments", "")
         if not isinstance(arguments, str):
-            try:
-                arguments = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
-            except (TypeError, ValueError):
-                self._out.emit_error("invalid_function_call", "Function call arguments must be JSON serializable")
-                return
+            self._out.emit_error("invalid_function_call", "Function call arguments must be JSON serializable")
+            return
         item_id = f"item_{uuid.uuid4().hex}"
         response_id = f"resp_{uuid.uuid4().hex}"
         try:
@@ -1110,7 +1107,7 @@ class ModelChannel:
         if function_call is _INVALID_FUNCTION_CALL:
             self._out.emit_error(
                 "invalid_function_call",
-                "A recognized function call requires call_id and name",
+                "Recognized function call is invalid",
             )
             return close_reason, True
         if isinstance(function_call, dict):
