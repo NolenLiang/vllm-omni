@@ -409,6 +409,7 @@ class SessionControl:
                 session.config,
                 deepcopy(dict(session.runtime_config)),
                 deepcopy(prepared_item),
+                history_len=len(session.history),
             )
             # Detach returned plugin-owned objects before terminal cleanup can
             # mutate or release them, while refusal is still retryable.

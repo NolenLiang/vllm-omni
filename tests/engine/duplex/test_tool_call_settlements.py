@@ -314,8 +314,8 @@ async def test_conversion_candidate_is_discarded_when_commit_returns_false(monke
         converted = []
         real_convert = h.runner.plugin.runtime_config_for_function_output
 
-        def convert(config, current, item):
-            candidate = real_convert(config, current, item)
+        def convert(config, current, item, **kwargs):
+            candidate = real_convert(config, current, item, **kwargs)
             converted.append(deepcopy(candidate))
             return candidate
 
@@ -462,7 +462,8 @@ async def test_a_rejected_conversion_cannot_mutate_nested_live_runtime_config(mo
         submissions_before = len(h.port.submissions)
         real_convert = h.runner.plugin.runtime_config_for_function_output
 
-        def reject(config, current, item):
+        def reject(config, current, item, **kwargs):
+            del item, kwargs
             current["conversion_probe"]["values"].append(2)
             raise DuplexRuntimeConfigError("the candidate cannot be rendered", code="bad_function_result")
 
@@ -526,8 +527,8 @@ async def test_accepted_cleanup_failure_installs_no_candidate_ack_or_continuatio
         real_continue = h.runner.model.maybe_continue_response
         real_dispose = h.runner.plugin.on_tool_calls_closed
 
-        def convert(config, current, item):
-            candidate = real_convert(config, current, item)
+        def convert(config, current, item, **kwargs):
+            candidate = real_convert(config, current, item, **kwargs)
             converted.append(deepcopy(candidate))
             return candidate
 
@@ -699,8 +700,8 @@ async def test_candidate_is_detached_before_terminal_cleanup_mutates_plugin_cach
         cache = {"values": [1]}
         real_convert = h.runner.plugin.runtime_config_for_function_output
 
-        def convert(config, current, item):
-            candidate = real_convert(config, current, item)
+        def convert(config, current, item, **kwargs):
+            candidate = real_convert(config, current, item, **kwargs)
             candidate["cache_probe"] = cache
             return candidate
 
@@ -748,8 +749,8 @@ async def test_unexpected_preparation_failure_is_correlated_and_retryable(monkey
             h.session.replace_runtime_config({**before, "copy_probe": Uncopyable()})
         else:
 
-            def convert(config, current, item):
-                return {**real_convert(config, current, item), "copy_probe": Uncopyable()}
+            def convert(config, current, item, **kwargs):
+                return {**real_convert(config, current, item, **kwargs), "copy_probe": Uncopyable()}
 
             monkeypatch.setattr(h.runner.plugin, "runtime_config_for_function_output", convert)
         events = await h.run(commands.CreateItem(item=output_item(call_id), event_id="prepare-failed"))

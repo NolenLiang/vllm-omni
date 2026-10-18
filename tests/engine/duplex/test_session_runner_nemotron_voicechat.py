@@ -423,13 +423,13 @@ async def test_a_plugin_refusal_keeps_the_call_answerable_and_the_retry_is_admit
     real = plugin.runtime_config_for_function_output
     attempts = {"n": 0}
 
-    def flaky(config, current, item):
+    def flaky(config, current, item, **kwargs):
         attempts["n"] += 1
         if attempts["n"] == 1:
             raise plugin_module.NemotronVoiceChatClientRuntimeConfigError(
                 "the tool-result channel is busy", code="invalid_function_call_output"
             )
-        return real(config, current, item)
+        return real(config, current, item, **kwargs)
 
     plugin.runtime_config_for_function_output = flaky
     first = await answer(h, call_id)

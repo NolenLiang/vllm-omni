@@ -354,6 +354,45 @@ def test_unaligned_response_only_materializes_an_existing_answer_slot(reserve_sl
     assert session.history == (first.message,)
 
 
+def test_sent_audio_without_text_can_still_be_acknowledged():
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    user = session.commit_audio_input(transcript="What is the weather in Taipei?")
+    response_id = session.begin_response()
+    session.reserve_history_item(f"item_{response_id}")
+    session.mark_audio_sent(duration_ms=696, text_requires_complete_audio=True, audio_complete=True)
+
+    assert session.end_response(commit_text=True) is None
+    assert session.active_response_id is None
+    assert session.has_assistant_response_item(response_id, f"item_{response_id}")
+
+    ack = apply_playback_ack(
+        session,
+        {
+            "type": "playback.ack",
+            "response_id": response_id,
+            "item_id": f"item_{response_id}",
+            "played_ms": 696,
+            "committed_ms": 696,
+        },
+    )
+    assert "error" not in ack[0].to_realtime()
+    assert ack[0].to_realtime()["event"]["playback"]["committed_ms"] == 696
+    assert session.playback.sent_ms == session.playback.committed_ms == 696
+    # The reserved slot stays as an empty turn. There is no transcript to store.
+    assert session.history == (user.message, {"role": "assistant", "content": ""})
+
+
+def test_response_with_no_audio_and_no_text_is_not_ackable():
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    response_id = session.begin_response()
+    session.reserve_history_item(f"item_{response_id}")
+
+    assert session.end_response(commit_text=True) is None
+    assert not session.has_assistant_response_item(response_id, f"item_{response_id}")
+    ack = apply_playback_ack(session, {"response_id": response_id, "played_ms": 0})
+    assert ack[0].to_realtime()["error"]["code"] == "playback_item_not_found"
+
+
 @pytest.mark.parametrize("operation", ["delete", "truncate"])
 def test_removing_one_empty_assistant_preserves_the_other_turn_boundary(operation):
     session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
