@@ -10,8 +10,11 @@ from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexFence, duplex_resource_request_id
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
 from vllm_omni.engine.duplex.session.model_channel import (
+    _ARGUMENTS_MUST_BE_JSON,
     _INVALID_FUNCTION_CALL,
+    _MISSING_CALL_ID,
     _coerce_function_call,
+    _invalid_function_call_message,
     _recognized_function_call,
 )
 from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin, QwenDataPlane
@@ -233,6 +236,30 @@ def test_qwen_preparation_uses_the_supplied_call_and_can_be_repeated():
             {"type": "function_call_output", "call_id": "call_1", "name": "forged", "output": "25C"},
         )
     assert refused.value.code == "invalid_function_call_output"
+
+
+def test_nonfinite_tool_call_text_is_not_a_call():
+    nan_speech, nan_call = ThinkerToolCursor().absorb(
+        '<tool_call>{"name": "get_weather", "arguments": {"x": NaN}}</tool_call>'
+    )
+    assert nan_speech == ""
+    assert nan_call == {"call_id": "", "name": "", "invalid": "1"}
+    inf_speech, inf_call = ThinkerToolCursor().absorb(
+        '<tool_call>{"name": "get_weather", "arguments": {"x": Infinity}}</tool_call>'
+    )
+    assert inf_speech == ""
+    assert inf_call == {"call_id": "", "name": "", "invalid": "1"}
+
+
+def test_invalid_function_call_message_keeps_the_reason():
+    assert _invalid_function_call_message(SimpleNamespace(), {"function_call": True}) == _MISSING_CALL_ID
+    assert (
+        _invalid_function_call_message(
+            SimpleNamespace(),
+            {"function_call": True, "call_id": "call_1", "name": "get_weather", "arguments": object()},
+        )
+        == _ARGUMENTS_MUST_BE_JSON
+    )
 
 
 def test_malformed_tool_call_is_not_speech():

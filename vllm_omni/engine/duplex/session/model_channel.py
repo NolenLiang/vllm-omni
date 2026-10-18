@@ -74,6 +74,8 @@ def _response_awaits_playback_ack(session, response_id, *, should_commit: bool, 
 
 
 _INVALID_FUNCTION_CALL = object()
+_MISSING_CALL_ID = "A recognized function call requires call_id and name"
+_ARGUMENTS_MUST_BE_JSON = "Function call arguments must be a JSON string"
 
 
 def _coerce_function_call(raw: object) -> dict[str, str] | None:
@@ -124,6 +126,21 @@ def _recognized_function_call(plugin: object, model_result: Mapping[str, object]
         return _legacy_function_call(model_result)
     call = _coerce_function_call(parsed)
     return call if call is not None else _INVALID_FUNCTION_CALL
+
+
+def _invalid_function_call_message(plugin: object, model_result: Mapping[str, object]) -> str:
+    """Why a recognized call was refused, for the client error text."""
+    parse = getattr(plugin, "parse_function_call", None)
+    candidate = parse(model_result) if callable(parse) else model_result
+    if candidate is None:
+        candidate = model_result
+    if not isinstance(candidate, Mapping):
+        return _MISSING_CALL_ID
+    call_id = candidate.get("call_id")
+    name = candidate.get("name")
+    if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
+        return _MISSING_CALL_ID
+    return _ARGUMENTS_MUST_BE_JSON
 
 
 class SilenceContinuationScheduler(Protocol):
@@ -1008,11 +1025,11 @@ class ModelChannel:
         session = self._ctx.session
         call_id, name = function_call.get("call_id"), function_call.get("name")
         if not isinstance(call_id, str) or not call_id or not isinstance(name, str) or not name:
-            self._out.emit_error("invalid_function_call", "A recognized function call requires call_id and name")
+            self._out.emit_error("invalid_function_call", _MISSING_CALL_ID)
             return
         arguments = function_call.get("arguments", "")
         if not isinstance(arguments, str):
-            self._out.emit_error("invalid_function_call", "Function call arguments must be JSON serializable")
+            self._out.emit_error("invalid_function_call", _ARGUMENTS_MUST_BE_JSON)
             return
         item_id = f"item_{uuid.uuid4().hex}"
         response_id = f"resp_{uuid.uuid4().hex}"
@@ -1107,7 +1124,7 @@ class ModelChannel:
         if function_call is _INVALID_FUNCTION_CALL:
             self._out.emit_error(
                 "invalid_function_call",
-                "Recognized function call is invalid",
+                _invalid_function_call_message(self._ctx.plugin, model_result),
             )
             return close_reason, True
         if isinstance(function_call, dict):
