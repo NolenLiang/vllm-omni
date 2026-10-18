@@ -9,7 +9,6 @@ import pytest
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexFence, duplex_resource_request_id
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
-from vllm_omni.engine.duplex.realtime_events import prepared_function_call_output
 from vllm_omni.engine.duplex.session.model_channel import (
     _INVALID_FUNCTION_CALL,
     _coerce_function_call,
@@ -862,23 +861,6 @@ def test_new_user_audio_does_not_rebind_the_previous_question():
     assert payloads == ["paris", "tokyo"]
 
 
-def test_projected_function_call_supplies_name_and_arguments():
-    prepared = prepared_function_call_output(
-        {"type": "function_call_output", "call_id": "call_1", "output": "25C", "name": "forged"},
-        {
-            "item_1": {
-                "type": "function_call",
-                "call_id": "call_1",
-                "name": "get_weather",
-                "arguments": '{"city":"Taipei"}',
-            }
-        },
-    )
-    assert prepared["name"] == "get_weather"
-    assert prepared["arguments"] == '{"city":"Taipei"}'
-    assert prepared["output"] == "25C"
-
-
 def test_missing_parse_function_call_is_not_a_call():
     assert _recognized_function_call(SimpleNamespace(), {"text": "hello"}) is None
     call = _recognized_function_call(
@@ -886,6 +868,7 @@ def test_missing_parse_function_call_is_not_a_call():
         {"function_call": True, "call_id": "call_1", "name": "get_weather", "arguments": {"city": "Taipei"}},
     )
     assert call == {"call_id": "call_1", "name": "get_weather", "arguments": '{"city": "Taipei"}'}
+    assert _recognized_function_call(SimpleNamespace(), {"function_call": True}) is _INVALID_FUNCTION_CALL
 
 
 def test_parse_function_call_json_dumps_dict_arguments():

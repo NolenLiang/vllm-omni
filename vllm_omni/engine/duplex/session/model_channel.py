@@ -92,37 +92,38 @@ def _coerce_function_call(raw: object) -> dict[str, str] | None:
     return {"call_id": call_id, "name": name, "arguments": arguments}
 
 
-def _recognized_function_call(plugin: object, model_result: Mapping[str, object]) -> dict[str, str] | object | None:
-    """Plugin parse first; otherwise the legacy ``function_call`` flag.
+def _legacy_function_call(model_result: Mapping[str, object]) -> dict[str, str] | object | None:
+    """The pre-parse ``function_call`` flag, or None when it is not set.
 
-    A plugin dict that is not a call is ``_INVALID_FUNCTION_CALL``. A missing
-    legacy ``call_id``/``name`` returns None so the caller can still project
-    the raw event. Plugins without ``parse_function_call`` are treated as no call.
+    A set flag that lacks ``call_id`` and ``name`` is invalid. There is no
+    second coerce at the caller.
     """
-    parse = getattr(plugin, "parse_function_call", None)
-    if not callable(parse):
-        if model_result.get("function_call") is not True:
-            return None
-        return _coerce_function_call(
-            {
-                "call_id": model_result.get("call_id"),
-                "name": model_result.get("name"),
-                "arguments": model_result.get("arguments", ""),
-            }
-        )
-    parsed = parse(model_result)
-    if parsed is not None:
-        call = _coerce_function_call(parsed)
-        return call if call is not None else _INVALID_FUNCTION_CALL
     if model_result.get("function_call") is not True:
         return None
-    return _coerce_function_call(
+    call = _coerce_function_call(
         {
             "call_id": model_result.get("call_id"),
             "name": model_result.get("name"),
             "arguments": model_result.get("arguments", ""),
         }
     )
+    return call if call is not None else _INVALID_FUNCTION_CALL
+
+
+def _recognized_function_call(plugin: object, model_result: Mapping[str, object]) -> dict[str, str] | object | None:
+    """Plugin parse first; otherwise the legacy ``function_call`` flag.
+
+    A plugin dict that is not a call is ``_INVALID_FUNCTION_CALL``. Plugins
+    without ``parse_function_call`` are no call unless the legacy flag is set.
+    """
+    parse = getattr(plugin, "parse_function_call", None)
+    if not callable(parse):
+        return _legacy_function_call(model_result)
+    parsed = parse(model_result)
+    if parsed is None:
+        return _legacy_function_call(model_result)
+    call = _coerce_function_call(parsed)
+    return call if call is not None else _INVALID_FUNCTION_CALL
 
 
 class SilenceContinuationScheduler(Protocol):
@@ -1103,22 +1104,6 @@ class ModelChannel:
             return close_reason, True
         if isinstance(function_call, dict):
             await self._expose_function_call(function_call)
-            return close_reason, True
-        if model_result.get("function_call") is True:
-            legacy = _coerce_function_call(
-                {
-                    "call_id": model_result.get("call_id"),
-                    "name": model_result.get("name"),
-                    "arguments": model_result.get("arguments", ""),
-                }
-            )
-            if legacy is None:
-                self._out.emit_error(
-                    "invalid_function_call",
-                    "A recognized function call requires call_id and name",
-                )
-            else:
-                await self._expose_function_call(legacy)
             return close_reason, True
         if model_result.get("requires_stage_handoff") is True or model_result.get("requires_tts_stage") is True:
             # Reserve the protocol response only when Stage1 emits text/audio.
