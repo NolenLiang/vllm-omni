@@ -162,6 +162,50 @@ def _register_exposed_call(
         h.session.replace_runtime_config(noted)
 
 
+def _published_call(events, call_id: str):
+    return [
+        event
+        for event in events
+        if event.type == "response.function_call_arguments.done" and getattr(event, "call_id", None) == call_id
+    ]
+
+
+@pytest.mark.asyncio
+async def test_parsed_qwen_call_registers_the_publish_anchor():
+    h = await open_qwen()
+    try:
+        h.session.append_history_message({"role": "user", "content": "Paris"})
+        await h.runner.model._send_one_model_output_event(
+            {
+                "qwen_function_call": {
+                    "call_id": "call_paris",
+                    "name": "get_weather",
+                    "arguments": {"city": "Paris"},
+                }
+            }
+        )
+        published = await h.settle()
+        done = _published_call(published, "call_paris")
+        assert len(done) == 1
+        assert done[0].arguments == '{"city": "Paris"}'
+        record = h.runner.tool_calls.record("call_paris")
+        assert record is not None and record.origin.arguments == '{"city": "Paris"}'
+        assert h.session.runtime_config["qwen_call_anchors"]["call_paris"] == 1
+        created = await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {"type": "function_call_output", "call_id": "call_paris", "output": "18C"}
+                ),
+            )
+        )
+        assert not any(getattr(event, "code", None) for event in created)
+        turns = h.session.runtime_config["qwen_tool_turns"]
+        assert turns[0]["history_len"] == 1
+        assert turns[0]["messages"][1]["content"] == "18C"
+    finally:
+        await h.manager.shutdown()
+
+
 @pytest.mark.asyncio
 async def test_nonserializable_arguments_are_not_published():
     h = await open_qwen()
@@ -171,7 +215,7 @@ async def test_nonserializable_arguments_are_not_published():
         )
         events = await h.settle()
         assert any(getattr(event, "code", None) == "invalid_function_call" for event in events)
-        assert not any(event.type == "function_call.done" for event in events)
+        assert _published_call(events, "call_1") == []
         assert h.runner.tool_calls.record("call_1") is None
     finally:
         await h.manager.shutdown()
@@ -186,12 +230,10 @@ async def test_note_published_failure_closes_the_unpublished_call():
             raise RuntimeError("anchor failed")
 
         h.runner.plugin.note_published_function_call = boom
-        await h.runner.model._expose_function_call(
-            {"call_id": "call_paris", "name": "get_weather", "arguments": "{}"}
-        )
+        await h.runner.model._expose_function_call({"call_id": "call_paris", "name": "get_weather", "arguments": "{}"})
         events = await h.settle()
         assert any(getattr(event, "code", None) == "tool_call_registration_failed" for event in events)
-        assert not any(event.type == "function_call.done" for event in events)
+        assert _published_call(events, "call_paris") == []
         assert any(event.type == "session.closed" for event in events)
         assert h.runner.tool_calls.record("call_paris") is None
     finally:
