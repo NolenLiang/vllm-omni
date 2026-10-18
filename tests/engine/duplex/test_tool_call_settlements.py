@@ -671,11 +671,26 @@ async def test_replayed_internal_settlements_repeat_neither_cleanup_nor_model_ef
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("arguments", [{"x": 1}, ["x", 1], None])
-async def test_exposure_uses_identical_json_arguments_in_origin_and_wire(monkeypatch, arguments):
+async def test_non_string_arguments_are_rejected_without_publication(monkeypatch, arguments):
+    async with open_timed_harness(monkeypatch) as h:
+        await prepare(h)
+        before = len(h.runner.tool_calls)
+        await h.runner.model._expose_function_call(
+            {"call_id": "structured-call", "name": "lookup", "arguments": arguments}
+        )
+        events = await h.settle()
+        assert error_codes(events) == ["invalid_function_call"]
+        assert h.runner.tool_calls.record("structured-call") is None
+        assert len(h.runner.tool_calls) == before
+
+
+@pytest.mark.asyncio
+async def test_string_arguments_are_identical_in_origin_and_wire(monkeypatch):
     async with open_timed_harness(monkeypatch) as h:
         await prepare(h)
         captured = []
         real_emit = h.runner.out.emit
+        arguments = '{"x": 1}'
 
         def emit(payload):
             if payload.get("type") == "function_call.done":
@@ -689,8 +704,8 @@ async def test_exposure_uses_identical_json_arguments_in_origin_and_wire(monkeyp
         assert len(captured) == 1
         call = h.runner.tool_calls.record("structured-call")
         assert call is not None
-        assert call.origin.arguments == captured[0]["arguments"]
-        assert json.loads(call.origin.arguments) == arguments
+        assert call.origin.arguments == captured[0]["arguments"] == arguments
+        assert json.loads(call.origin.arguments) == {"x": 1}
 
 
 @pytest.mark.asyncio

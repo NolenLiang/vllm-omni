@@ -1178,7 +1178,11 @@ class ModelChannel:
                 and (model_turn_id is not None or session.active_response_id is not None)
             ):
                 self._ctx.services.spawn(
-                    self.maybe_continue_response(expected_epoch=expected_epoch, expected_model_turn_id=model_turn_id),
+                    self.maybe_continue_response(
+                        expected_epoch=expected_epoch,
+                        expected_model_turn_id=model_turn_id,
+                        finished_segment=True,
+                    ),
                     name="duplex-continue",
                 )
             return close_reason, emitted_response
@@ -1346,7 +1350,8 @@ class ModelChannel:
             and auto_response
         ):
             self._ctx.services.spawn(
-                self.maybe_continue_response(expected_epoch=expected_epoch), name="duplex-continue"
+                self.maybe_continue_response(expected_epoch=expected_epoch, finished_segment=True),
+                name="duplex-continue",
             )
         if end_of_turn:
             data_plane_request_id = model_result.get("data_plane_request_id")
@@ -1612,6 +1617,7 @@ class ModelChannel:
         expected_epoch: int | None,
         expected_model_turn_id: int | None = None,
         expected_response_id: str | None = None,
+        finished_segment: bool = False,
     ) -> None:
         session = self._ctx.session
         model_state = self._ctx.model_state
@@ -1629,13 +1635,14 @@ class ModelChannel:
         # A continue for a response that still has draining TTS must not emit
         # response.done here; that finish owns the done event.
         if not session.capabilities.supports_core_resumable_request:
-            # A fast tool result must not end the response while the original
-            # request is still running. Ending it clears active_request_id and
-            # the later final cannot own the stream.
+            # While stage0 is still producing, closing here clears
+            # active_request_id and the later final cannot own the stream.
+            # A finished TTS segment is that final, so it still closes.
             request_id = getattr(session, "active_request_id", None)
             data_plane = getattr(self._ctx.plugin, "data_plane", None)
             if (
-                isinstance(request_id, str)
+                not finished_segment
+                and isinstance(request_id, str)
                 and data_plane is not None
                 and callable(getattr(data_plane, "is_terminal", None))
                 and not data_plane.is_terminal(request_id)
