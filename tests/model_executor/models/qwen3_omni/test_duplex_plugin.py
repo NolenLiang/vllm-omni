@@ -162,6 +162,23 @@ def _register_exposed_call(
         h.session.replace_runtime_config(noted)
 
 
+async def _publish_call(
+    h,
+    call_id: str,
+    *,
+    name: str = "get_weather",
+    arguments: str = '{"city":"Paris"}',
+) -> None:
+    """Publish through ``_expose_function_call``, the session's real path.
+
+    That records the ledger origin, stores the Qwen anchor, and emits
+    ``function_call.done``. Calling ``register`` by itself can drift from
+    the ids and ordering production uses.
+    """
+    await h.runner.model._expose_function_call({"call_id": call_id, "name": name, "arguments": arguments})
+    await h.settle()
+
+
 def _published_call(events, call_id: str):
     return [
         event
@@ -202,6 +219,33 @@ async def test_parsed_qwen_call_registers_the_publish_anchor():
         turns = h.session.runtime_config["qwen_tool_turns"]
         assert turns[0]["history_len"] == 1
         assert turns[0]["messages"][1]["content"] == "18C"
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_conversation_history_alone_does_not_expose_a_call():
+    h = await open_qwen()
+    try:
+        projector = h.runner.out.require_projector()
+        projector.conversation_items["item_call"] = {
+            "type": "function_call",
+            "call_id": "call_x",
+            "name": "get_weather",
+            "arguments": '{"city":"Paris"}',
+        }
+        created = await h.run(
+            CreateItem(
+                item=normalize_conversation_item(
+                    {"type": "function_call_output", "call_id": "call_x", "output": "18C"}
+                ),
+            )
+        )
+        assert any(getattr(event, "code", None) == "invalid_function_call_output" for event in created)
+        assert "conversation.item.created" not in [event.type for event in created]
+        assert not h.runner.plugin.has_pending_tool_followup(h.session.runtime_config)
+        started = await h.run(CreateResponse())
+        assert any(getattr(event, "code", None) == "response_create_without_input" for event in started)
     finally:
         await h.manager.shutdown()
 
@@ -1099,7 +1143,7 @@ async def test_response_create_after_function_call_output_opens_one_follow_up():
     h = await open_qwen()
     try:
         h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
-        _register_exposed_call(h, "call_1")
+        await _publish_call(h, "call_1")
         created = await h.run(
             CreateItem(
                 item=normalize_conversation_item(
@@ -1138,7 +1182,7 @@ async def test_late_playback_ack_stores_the_answer_and_drops_the_tool_pair():
     h = await open_qwen()
     try:
         h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
-        _register_exposed_call(h, "call_1")
+        await _publish_call(h, "call_1")
         await h.run(
             CreateItem(
                 item=normalize_conversation_item(
@@ -1173,7 +1217,7 @@ async def test_user_turn_before_playback_ack_still_sees_the_tool_pair():
     h = await open_qwen()
     try:
         h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
-        _register_exposed_call(h, "call_1")
+        await _publish_call(h, "call_1")
         await h.run(
             CreateItem(
                 item=normalize_conversation_item(
@@ -1219,7 +1263,7 @@ async def test_playback_clear_before_ack_puts_the_tool_pair_back():
     h = await open_qwen()
     try:
         h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
-        _register_exposed_call(h, "call_1")
+        await _publish_call(h, "call_1")
         await h.run(
             CreateItem(
                 item=normalize_conversation_item(
@@ -1251,7 +1295,7 @@ async def test_overlap_barge_in_before_playback_keeps_the_tool_result():
     h = await open_qwen()
     try:
         h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
-        _register_exposed_call(h, "call_1")
+        await _publish_call(h, "call_1")
         await h.run(
             CreateItem(
                 item=normalize_conversation_item(
@@ -1282,7 +1326,7 @@ async def test_overlap_barge_in_after_partial_playback_leaves_the_tool_pair_infl
     h = await open_qwen()
     try:
         h.session.append_history_message({"role": "user", "content": "what is the weather in Paris"})
-        _register_exposed_call(h, "call_1")
+        await _publish_call(h, "call_1")
         await h.run(
             CreateItem(
                 item=normalize_conversation_item(
