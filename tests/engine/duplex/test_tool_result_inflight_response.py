@@ -8,6 +8,7 @@ capability override, as other generic lifecycle tests do. This checks the
 shared result-admission boundary, not Qwen parsing or model inference.
 """
 
+from collections.abc import Coroutine
 from dataclasses import replace
 
 import pytest
@@ -75,4 +76,57 @@ async def test_fast_tool_result_preserves_inflight_nonresumable_response(auto_re
         assert len(h.port.submissions) > before
         assert h.port.submissions[-1].context.request_id != request_id
     finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_stale_finished_segment_does_not_close_the_next_response():
+    """A segment-end continuation must not finish a response opened later.
+
+    The continuation is spawned, so a fast tool result can replace the active
+    response before it runs. Response B's stage0 is still producing and must
+    not receive that stale ``response.done``.
+    """
+    h = await open_harness(auto_response=True)
+    held: list[Coroutine[object, object, None]] = []
+    try:
+        h.session.capabilities = replace(h.session.capabilities, supports_core_resumable_request=False)
+        assert error_codes(await h.run(append_audio())) == []
+        request_a = h.port.submissions[-1].context.request_id
+        await h.deliver_and_settle(
+            tts_output(request_a, text="partial", turn_id=h.session.turn_id, epoch=h.session.epoch)
+        )
+        response_a = h.session.active_response_id
+        assert response_a is not None and h.session.active_request_id == request_a
+
+        def hold_continuation(coro: Coroutine[object, object, None], *, name: str) -> None:
+            if name == "duplex-continue":
+                held.append(coro)
+                return
+            h.runner.__class__.spawn(h.runner, coro, name=name)
+
+        h.runner.spawn = hold_continuation  # type: ignore[method-assign]
+        h.deliver(
+            tts_output(
+                request_a,
+                text=" final",
+                finished=True,
+                tts_is_last_chunk=True,
+                turn_id=h.session.turn_id,
+                epoch=h.session.epoch,
+            )
+        )
+        await h.settle()
+        assert len(held) == 1
+        response_b = h.session.begin_response(turn_id=h.session.turn_id)
+        h.session.bind_request("request-b")
+        assert not h.runner.plugin.data_plane.is_terminal("request-b")
+        await held.pop()
+        events = await h.settle()
+        assert not any(event.type == "response.done" and event.response_id == response_b for event in events)
+        assert h.session.active_response_id == response_b
+        assert h.session.active_request_id == "request-b"
+    finally:
+        for coro in held:
+            coro.close()
         await close_harness(h)

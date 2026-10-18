@@ -1181,7 +1181,9 @@ class ModelChannel:
                     self.maybe_continue_response(
                         expected_epoch=expected_epoch,
                         expected_model_turn_id=model_turn_id,
+                        expected_response_id=session.active_response_id,
                         finished_segment=True,
+                        finished_request_id=(data_plane_request_id if isinstance(data_plane_request_id, str) else None),
                     ),
                     name="duplex-continue",
                 )
@@ -1350,7 +1352,12 @@ class ModelChannel:
             and auto_response
         ):
             self._ctx.services.spawn(
-                self.maybe_continue_response(expected_epoch=expected_epoch, finished_segment=True),
+                self.maybe_continue_response(
+                    expected_epoch=expected_epoch,
+                    expected_response_id=response_id if isinstance(response_id, str) else None,
+                    finished_segment=True,
+                    finished_request_id=(data_plane_request_id if isinstance(data_plane_request_id, str) else None),
+                ),
                 name="duplex-continue",
             )
         if end_of_turn:
@@ -1618,6 +1625,7 @@ class ModelChannel:
         expected_model_turn_id: int | None = None,
         expected_response_id: str | None = None,
         finished_segment: bool = False,
+        finished_request_id: str | None = None,
     ) -> None:
         session = self._ctx.session
         model_state = self._ctx.model_state
@@ -1637,11 +1645,16 @@ class ModelChannel:
         if not session.capabilities.supports_core_resumable_request:
             # While stage0 is still producing, closing here clears
             # active_request_id and the later final cannot own the stream.
-            # A finished TTS segment is that final, so it still closes.
+            # A finished segment may close only when that same request is still
+            # the active one. expected_response_id already drops a segment whose
+            # response was replaced before this spawned task ran.
             request_id = getattr(session, "active_request_id", None)
             data_plane = getattr(self._ctx.plugin, "data_plane", None)
+            segment_owns_active_request = (
+                finished_segment and isinstance(finished_request_id, str) and finished_request_id == request_id
+            )
             if (
-                not finished_segment
+                not segment_owns_active_request
                 and isinstance(request_id, str)
                 and data_plane is not None
                 and callable(getattr(data_plane, "is_terminal", None))
