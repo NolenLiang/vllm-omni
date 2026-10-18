@@ -887,9 +887,12 @@ class DuplexSessionRunner:
 
         An accepted result is written into the session's runtime config, and
         some runtimes only apply it on their next frame. Cancelling the epoch
-        under it must not let it speak in the new generation, so the plugin is
-        asked to retire what is still queued. False means the session is closing
-        because the plugin could not prove the queue is clean.
+        under it must not let that queued frame speak in the new generation, so
+        the plugin is asked to retire what is still queued. A plugin that
+        splices the pair into a later prompt leaves this hook as a no-op;
+        ``runtime_config_after_response`` decides whether that pair is still
+        answerable. False means the session is closing because the plugin could
+        not prove the queue is clean.
         """
         session = self.session
         try:

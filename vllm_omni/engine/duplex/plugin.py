@@ -707,10 +707,16 @@ class DuplexModelPlugin(ABC):
 
         A ``function_call_output`` is accepted into the runtime config, and a
         frame-locked model may only pick it up on a later frame. When the epoch
-        advances (a cancel or barge-in), that queued result belongs to the
+        advances (a cancel or barge-in), that queued frame belongs to the
         generation that was just cancelled and must not be spoken in the next
         one. Plugins with a queued function channel override this; the default
         keeps nothing queued and returns ``None`` (no change).
+
+        A history-spliced pair is a different owner. Qwen puts that pair back
+        through ``runtime_config_after_response`` when the response is cancelled
+        or cleared before its text is stored, and a later ``response.create``
+        may answer it in the new epoch. This hook does not drop that pair.
+        The epoch bump still cancels pending ledger calls.
 
         Returning a config must not reset a monotonic cursor the worker keys
         its "already consumed" watermark on -- only the queue itself is retired.

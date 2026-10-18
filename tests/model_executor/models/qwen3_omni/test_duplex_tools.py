@@ -869,6 +869,14 @@ def test_missing_parse_function_call_is_not_a_call():
     )
     assert call == {"call_id": "call_1", "name": "get_weather", "arguments": '{"city": "Taipei"}'}
     assert _recognized_function_call(SimpleNamespace(), {"function_call": True}) is _INVALID_FUNCTION_CALL
+    assert (
+        _recognized_function_call(
+            SimpleNamespace(),
+            {"function_call": True, "call_id": "call_1", "name": "get_weather", "arguments": object()},
+        )
+        is _INVALID_FUNCTION_CALL
+    )
+    assert _coerce_function_call({"call_id": "c", "name": "n", "arguments": object()}) is None
 
 
 def test_parse_function_call_json_dumps_dict_arguments():
@@ -877,6 +885,17 @@ def test_parse_function_call_json_dumps_dict_arguments():
         {"qwen_function_call": {"call_id": "call_1", "name": "get_weather", "arguments": {"city": "Taipei"}}}
     )
     assert parsed == {"call_id": "call_1", "name": "get_weather", "arguments": '{"city": "Taipei"}'}
+    refused = plugin.parse_function_call(
+        {"qwen_function_call": {"call_id": "call_1", "name": "get_weather", "arguments": object()}}
+    )
+    assert refused == {"call_id": "invalid", "name": ""}
+    assert (
+        _recognized_function_call(
+            plugin,
+            {"qwen_function_call": {"call_id": "call_1", "name": "get_weather", "arguments": object()}},
+        )
+        is _INVALID_FUNCTION_CALL
+    )
     assert _coerce_function_call({"call_id": "c", "name": "n", "arguments": {"x": 1}}) == {
         "call_id": "c",
         "name": "n",

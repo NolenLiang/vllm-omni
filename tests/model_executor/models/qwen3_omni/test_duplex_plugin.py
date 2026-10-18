@@ -163,6 +163,42 @@ def _register_exposed_call(
 
 
 @pytest.mark.asyncio
+async def test_nonserializable_arguments_are_not_published():
+    h = await open_qwen()
+    try:
+        await h.runner.model._send_one_model_output_event(
+            {"function_call": True, "call_id": "call_1", "name": "get_weather", "arguments": object()}
+        )
+        events = await h.settle()
+        assert any(getattr(event, "code", None) == "invalid_function_call" for event in events)
+        assert not any(event.type == "function_call.done" for event in events)
+        assert h.runner.tool_calls.record("call_1") is None
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_note_published_failure_closes_the_unpublished_call():
+    h = await open_qwen()
+    try:
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("anchor failed")
+
+        h.runner.plugin.note_published_function_call = boom
+        await h.runner.model._expose_function_call(
+            {"call_id": "call_paris", "name": "get_weather", "arguments": "{}"}
+        )
+        events = await h.settle()
+        assert any(getattr(event, "code", None) == "tool_call_registration_failed" for event in events)
+        assert not any(event.type == "function_call.done" for event in events)
+        assert any(event.type == "session.closed" for event in events)
+        assert h.runner.tool_calls.record("call_paris") is None
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_two_committed_turns_stream_text_and_audio_and_release_requests():
     h = await open_qwen()
     try:

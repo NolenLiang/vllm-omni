@@ -88,7 +88,7 @@ def _coerce_function_call(raw: object) -> dict[str, str] | None:
         try:
             arguments = json.dumps(arguments, ensure_ascii=False)
         except (TypeError, ValueError):
-            arguments = str(arguments)
+            return None
     return {"call_id": call_id, "name": name, "arguments": arguments}
 
 
@@ -1036,11 +1036,22 @@ class ModelChannel:
             if exc.code != "resource_exhausted":
                 await self._close_from_runtime("tool_call_lifecycle")
             return
-        updated_runtime = self._ctx.plugin.note_published_function_call(
-            session.runtime_config,
-            call_id=call_id,
-            history_len=len(session.history),
-        )
+        try:
+            updated_runtime = self._ctx.plugin.note_published_function_call(
+                session.runtime_config,
+                call_id=call_id,
+                history_len=len(session.history),
+            )
+        except Exception:
+            # The call is already in the ledger and the client has not seen it.
+            # Leaving it pending would time out a call that was never published.
+            logger.exception("Failed to record a published function call")
+            self._out.emit_error(
+                "tool_call_registration_failed",
+                "the session could not record a published function call",
+            )
+            await self._close_from_runtime("tool_call_lifecycle")
+            return
         if updated_runtime is not None:
             session.replace_runtime_config(updated_runtime)
         self._out.emit(
