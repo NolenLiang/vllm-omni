@@ -1177,13 +1177,17 @@ class ModelChannel:
                 and auto_response
                 and (model_turn_id is not None or session.active_response_id is not None)
             ):
+                request_key = data_plane_request_id if isinstance(data_plane_request_id, str) else None
+                draining_response_id = (
+                    session.response_id_for_request(request_key) if session.is_draining_request(request_key) else None
+                )
                 self._ctx.services.spawn(
                     self.maybe_continue_response(
                         expected_epoch=expected_epoch,
                         expected_model_turn_id=model_turn_id,
-                        expected_response_id=session.active_response_id,
+                        expected_response_id=draining_response_id or session.active_response_id,
                         finished_segment=True,
-                        finished_request_id=(data_plane_request_id if isinstance(data_plane_request_id, str) else None),
+                        finished_request_id=request_key,
                     ),
                     name="duplex-continue",
                 )
@@ -1632,6 +1636,10 @@ class ModelChannel:
         response_id = session.active_response_id
         if expected_response_id is not None and response_id != expected_response_id:
             return
+        # This segment did not own a response. A response opened while the
+        # spawned task waited belongs to someone else.
+        if finished_segment and expected_response_id is None and response_id is not None:
+            return
         auto_response = self._out.auto_responds()
         if session.state == DuplexSessionState.CLOSED or self._ctx.run.closing:
             model_state.clear_continuation()
@@ -1650,6 +1658,11 @@ class ModelChannel:
             # response was replaced before this spawned task ran.
             request_id = getattr(session, "active_request_id", None)
             data_plane = getattr(self._ctx.plugin, "data_plane", None)
+            # A segment from another request has nothing of its own to close,
+            # including when the active request is already terminal or unbound.
+            if finished_segment and isinstance(finished_request_id, str) and finished_request_id != request_id:
+                model_state.clear_continuation()
+                return
             segment_owns_active_request = (
                 finished_segment and isinstance(finished_request_id, str) and finished_request_id == request_id
             )
